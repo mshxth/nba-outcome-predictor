@@ -3,3 +3,9 @@ GAMES/
 SCORES/
 TEAMS/
 .DS_Store
+
+backup/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
