@@ -165,7 +165,7 @@ def get_team_comparison_stats(home_team, away_team, date=None):
     
     # Determine advantages
     def get_advantage(home_val, away_val, lower_is_better=False):
-        if abs(home_val - away_val) < 0.1:
+        if abs(home_val - away_val) < 0.01:
             return "even"
         if lower_is_better:
             return "home" if home_val < away_val else "away"
