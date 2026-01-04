@@ -3,6 +3,7 @@
 import pickle
 import os
 from datetime import datetime
+from functools import lru_cache
 
 # Import from current directory (backend folder)
 from config import TEAM_TO_ABBR
@@ -14,12 +15,23 @@ from data import (
 # Paths - use local files
 MODEL_PATH = 'models/trained_model.pkl'
 
+# Global cache for model and injuries
+_model_cache = None
+_injury_cache = {}
+_injury_cache_time = {}
+
 
 def load_model():
-    """Load the trained model from pickle file."""
+    """Load the trained model from pickle file (cached)."""
+    global _model_cache
+    
+    if _model_cache is not None:
+        return _model_cache
+    
     try:
         with open(MODEL_PATH, 'rb') as f:
             model_data = pickle.load(f)
+        _model_cache = model_data
         return model_data
     except FileNotFoundError:
         raise Exception(f"Model file not found at {MODEL_PATH}")
@@ -27,9 +39,52 @@ def load_model():
         raise Exception(f"Failed to load model: {e}")
 
 
+def get_cached_injuries(team):
+    """Get injuries with caching (1 hour TTL)."""
+    global _injury_cache, _injury_cache_time
+    
+    now = datetime.now()
+    
+    # Check if cached and still fresh (1 hour)
+    if team in _injury_cache:
+        cache_age = (now - _injury_cache_time[team]).seconds
+        if cache_age < 3600:  # 1 hour cache
+            return _injury_cache[team]
+    
+    # Cache miss or stale - fetch fresh data
+    try:
+        injuries = scrape_team_injuries(team)
+        _injury_cache[team] = injuries
+        _injury_cache_time[team] = now
+        return injuries
+    except Exception as e:
+        print(f"Error fetching injuries for {team}: {e}")
+        return []
+
+
+@lru_cache(maxsize=128)
+def get_cached_team_stats(date, home_team, away_team):
+    """Cache team stats for prediction."""
+    home_rtg, away_rtg = get_input_format(date, home_team, away_team, get_avg_rtgs)
+    home_efg, away_efg = get_input_format(date, home_team, away_team, get_avg_efgs)
+    home_tov, away_tov = get_input_format(date, home_team, away_team, get_avg_tovs)
+    home_orb, away_orb = get_input_format(date, home_team, away_team, get_avg_orbs)
+    
+    return {
+        'home_rtg': home_rtg,
+        'away_rtg': away_rtg,
+        'home_efg': home_efg,
+        'away_efg': away_efg,
+        'home_tov': home_tov,
+        'away_tov': away_tov,
+        'home_orb': home_orb,
+        'away_orb': away_orb
+    }
+
+
 def predict_game_outcome(home_team, away_team, model_data, date=None):
     """
-    Predict the outcome of a game.
+    Predict the outcome of a game (optimized with caching).
     
     Args:
         home_team: Home team city name
@@ -50,25 +105,21 @@ def predict_game_outcome(home_team, away_team, model_data, date=None):
     if date is None:
         prediction_date = "2025-04-14"
     else:
-        # Validate date format
         try:
             datetime.strptime(date, "%Y-%m-%d")
             prediction_date = date
         except ValueError:
             raise ValueError("Date must be in YYYY-MM-DD format")
     
-    # Extract model and features
+    # Extract model
     rf_model = model_data['model']
     
-    # Get features
-    home_rtg, away_rtg = get_input_format(prediction_date, home_team, away_team, get_avg_rtgs)
-    home_efg, away_efg = get_input_format(prediction_date, home_team, away_team, get_avg_efgs)
-    home_tov, away_tov = get_input_format(prediction_date, home_team, away_team, get_avg_tovs)
-    home_orb, away_orb = get_input_format(prediction_date, home_team, away_team, get_avg_orbs)
+    # Get cached team stats
+    stats = get_cached_team_stats(prediction_date, home_team, away_team)
     
-    # Get injuries
-    home_injuries = scrape_team_injuries(home_team)
-    away_injuries = scrape_team_injuries(away_team)
+    # Get cached injuries
+    home_injuries = get_cached_injuries(home_team)
+    away_injuries = get_cached_injuries(away_team)
     
     home_injury_value = get_injury_value(home_injuries, home_team)
     away_injury_value = get_injury_value(away_injuries, away_team)
@@ -79,14 +130,14 @@ def predict_game_outcome(home_team, away_team, model_data, date=None):
     # Build input
     import pandas as pd
     input_data = { 
-        "Home ORtg": [home_rtg], 
-        "Away ORtg": [away_rtg], 
-        "Home eFG%": [home_efg], 
-        "Away eFG%": [away_efg], 
-        "Home TOV%": [home_tov], 
-        "Away TOV%": [away_tov], 
-        "Home ORB%": [home_orb], 
-        "Away ORB%": [away_orb], 
+        "Home ORtg": [stats['home_rtg']], 
+        "Away ORtg": [stats['away_rtg']], 
+        "Home eFG%": [stats['home_efg']], 
+        "Away eFG%": [stats['away_efg']], 
+        "Home TOV%": [stats['home_tov']], 
+        "Away TOV%": [stats['away_tov']], 
+        "Home ORB%": [stats['home_orb']], 
+        "Away ORB%": [stats['away_orb']], 
         "Home Injury Value": [home_injury_value], 
         "Away Injury Value": [away_injury_value],
         "Home Injury Advanced": [home_injury_advanced], 
@@ -105,16 +156,16 @@ def predict_game_outcome(home_team, away_team, model_data, date=None):
     return winner, confidence_value
 
 
+def clear_injury_cache():
+    """Clear injury cache (call this from a scheduled endpoint)."""
+    global _injury_cache, _injury_cache_time
+    _injury_cache = {}
+    _injury_cache_time = {}
+    return True
+
+
 def get_model_info(model_data):
-    """
-    Get information about the model.
-    
-    Args:
-        model_data: Loaded model data
-        
-    Returns:
-        Dictionary with model information
-    """
+    """Get information about the model."""
     return {
         "accuracy": round(model_data.get('accuracy', 0) * 100, 2),
         "features": len(model_data.get('features', [])),
@@ -123,17 +174,7 @@ def get_model_info(model_data):
 
 
 def get_team_comparison_stats(home_team, away_team, date=None):
-    """
-    Get detailed comparison stats for two teams.
-    
-    Args:
-        home_team: Home team city name
-        away_team: Away team city name
-        date: Game date (YYYY-MM-DD) or None for default
-        
-    Returns:
-        Dictionary with detailed stats for both teams
-    """
+    """Get detailed comparison stats (optimized with caching)."""
     from datetime import datetime
     
     # Validate teams
@@ -150,22 +191,19 @@ def get_team_comparison_stats(home_team, away_team, date=None):
     except ValueError:
         raise ValueError("Date must be in YYYY-MM-DD format")
     
-    # Get all the stats used in prediction
-    home_rtg, away_rtg = get_input_format(prediction_date, home_team, away_team, get_avg_rtgs)
-    home_efg, away_efg = get_input_format(prediction_date, home_team, away_team, get_avg_efgs)
-    home_tov, away_tov = get_input_format(prediction_date, home_team, away_team, get_avg_tovs)
-    home_orb, away_orb = get_input_format(prediction_date, home_team, away_team, get_avg_orbs)
+    # Get cached stats
+    stats = get_cached_team_stats(prediction_date, home_team, away_team)
     
-    # Get injuries
-    home_injuries = scrape_team_injuries(home_team)
-    away_injuries = scrape_team_injuries(away_team)
+    # Get cached injuries
+    home_injuries = get_cached_injuries(home_team)
+    away_injuries = get_cached_injuries(away_team)
     
     home_injury_value = get_injury_value(home_injuries, home_team)
     away_injury_value = get_injury_value(away_injuries, away_team)
     
     # Determine advantages
     def get_advantage(home_val, away_val, lower_is_better=False):
-        if abs(home_val - away_val) < 0.01:
+        if abs(home_val - away_val) < 0.1:
             return "even"
         if lower_is_better:
             return "home" if home_val < away_val else "away"
@@ -177,27 +215,27 @@ def get_team_comparison_stats(home_team, away_team, date=None):
         "stats": [
             {
                 "metric": "Off Rating",
-                "home": f"{home_rtg:.1f}",
-                "away": f"{away_rtg:.1f}",
-                "advantage": get_advantage(home_rtg, away_rtg)
+                "home": f"{stats['home_rtg']:.1f}",
+                "away": f"{stats['away_rtg']:.1f}",
+                "advantage": get_advantage(stats['home_rtg'], stats['away_rtg'])
             },
             {
                 "metric": "eFG%",
-                "home": f"{home_efg:.1f}%",
-                "away": f"{away_efg:.1f}%",
-                "advantage": get_advantage(home_efg, away_efg)
+                "home": f"{stats['home_efg']:.1f}%",
+                "away": f"{stats['away_efg']:.1f}%",
+                "advantage": get_advantage(stats['home_efg'], stats['away_efg'])
             },
             {
                 "metric": "TOV%",
-                "home": f"{home_tov:.1f}%",
-                "away": f"{away_tov:.1f}%",
-                "advantage": get_advantage(home_tov, away_tov, lower_is_better=True)
+                "home": f"{stats['home_tov']:.1f}%",
+                "away": f"{stats['away_tov']:.1f}%",
+                "advantage": get_advantage(stats['home_tov'], stats['away_tov'], lower_is_better=True)
             },
             {
                 "metric": "ORB%",
-                "home": f"{home_orb:.1f}%",
-                "away": f"{away_orb:.1f}%",
-                "advantage": get_advantage(home_orb, away_orb)
+                "home": f"{stats['home_orb']:.1f}%",
+                "away": f"{stats['away_orb']:.1f}%",
+                "advantage": get_advantage(stats['home_orb'], stats['away_orb'])
             },
             {
                 "metric": "Injury Impact",
@@ -207,23 +245,23 @@ def get_team_comparison_stats(home_team, away_team, date=None):
             },
             {
                 "metric": "Back-to-Back",
-                "home": "No",  # Would need to implement back-to-back check
+                "home": "No",
                 "away": "No",
                 "advantage": "even"
             }
         ],
         "breakdown": {
             "home": {
-                "off_rtg": home_rtg,
-                "efg_pct": home_efg,
-                "tov_pct": home_tov,
-                "orb_pct": home_orb
+                "off_rtg": stats['home_rtg'],
+                "efg_pct": stats['home_efg'],
+                "tov_pct": stats['home_tov'],
+                "orb_pct": stats['home_orb']
             },
             "away": {
-                "off_rtg": away_rtg,
-                "efg_pct": away_efg,
-                "tov_pct": away_tov,
-                "orb_pct": away_orb
+                "off_rtg": stats['away_rtg'],
+                "efg_pct": stats['away_efg'],
+                "tov_pct": stats['away_tov'],
+                "orb_pct": stats['away_orb']
             }
         }
     }

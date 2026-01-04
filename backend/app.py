@@ -143,6 +143,16 @@ def get_team_comparison():
     except Exception as e:
         return jsonify({"error": f"Failed to get stats: {str(e)}"}), 500
 
+@app.route('/api/refresh-cache', methods=['POST'])
+def refresh_cache():
+    """Refresh injury cache (call this daily)."""
+    from ml_model import clear_injury_cache
+    
+    try:
+        clear_injury_cache()
+        return jsonify({"message": "Cache cleared successfully"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.errorhandler(404)
 def not_found(e):
