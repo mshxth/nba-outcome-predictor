@@ -9,7 +9,7 @@ import StatsComparison from './components/StatsComparison'
 import ModelStats from './components/ModelStats'
 import PredictionBreakdown from './components/PredictionBreakdown'
 
-const API_BASE = 'https://nba-outcome-predictor.onrender.com'
+const API_BASE = 'https://nba-outcome-predictor.onrender.com/'
 
 function App() {
   const [activeTab, setActiveTab] = useState('predict')
