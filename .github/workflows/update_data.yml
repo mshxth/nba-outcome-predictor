@@ -1,0 +1,55 @@
+name: Update NBA data
+
+on:
+  schedule:
+    # Weekly (Sundays, 09:00 UTC) during the offseason -- there are no games to
+    # scrape, this just catches trades/signings on team pages. Switch this to
+    # '0 9 * * *' (nightly) once the 2026-27 season starts in October.
+    - cron: '0 9 * * 0'
+  workflow_dispatch:
+    inputs:
+      retrain:
+        description: 'Retrain the model this run'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r backend/requirements.txt
+
+      - name: Scrape new games
+        run: python3 pipeline/scrape_games.py
+
+      - name: Refresh team/player stats
+        run: python3 pipeline/scrape_teams.py
+
+      - name: Retrain model
+        # Manual runs can force a retrain via the "retrain" input; scheduled
+        # runs only retrain weekly (Sundays) since it's not needed nightly.
+        if: github.event.inputs.retrain == 'true' || github.event_name == 'schedule'
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ] || [ "$(date -u +%u)" = "7" ]; then
+            python3 pipeline/train_model.py
+          else
+            echo "Not Sunday, skipping scheduled retrain."
+          fi
+
+      - name: Commit updated data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add backend/data/nba_data.db backend/models/trained_model.pkl
+          git diff --cached --quiet || git commit -m "Automated data update $(date -u +%Y-%m-%d)"
+          git push

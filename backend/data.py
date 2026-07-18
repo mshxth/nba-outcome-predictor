@@ -1,10 +1,12 @@
 """Data functions using SQLite database instead of HTML parsing."""
 
 from datetime import datetime, timedelta
-from pathlib import Path
-from bs4 import BeautifulSoup, Comment
-from config import TEAM_TO_ABBR, get_last_30_days_from_date, get_last_7_days_from_date
-from database import get_team_stats_for_dates, get_home_win, check_back_to_back
+from functools import lru_cache
+from config import get_last_30_days_from_date, get_last_7_days_from_date
+from database import (
+    get_team_stats_for_dates, get_home_win, check_back_to_back,
+    get_latest_player_season_stats, get_current_injuries, get_game_injuries,
+)
 
 
 # ===== FUNCTIONS THAT NOW USE SQLITE =====
@@ -107,209 +109,48 @@ def get_input_format(date, home, away, func):
     return home_ret, away_ret
 
 
-# ===== FUNCTIONS THAT STILL USE HTML (for injuries) =====
-
-def scrape_team_roster(team):
-    """Get team roster from HTML."""
-    file = f"TEAMS/{TEAM_TO_ABBR[team]}.html"
-
-    with open(file) as f:
-        page = f.read()
-        
-    soup = BeautifulSoup(page, "html.parser")
-
-    roster = []
-    roster_data = soup.find('div', id='div_roster').find_all('tr')
-    for player_data in roster_data:
-        player = player_data.find('td', attrs={'data-stat': 'player'})
-        if player:
-            roster.append(player.find_all('a')[0].get_text())
-    
-    return roster
-
-
-def scrape_team_injuries(team):
-    """Get team injuries from HTML."""
-    file = f"TEAMS/{TEAM_TO_ABBR[team]}.html"
-    
-    with open(file) as f:
-        page = f.read()
-    
-    soup = BeautifulSoup(page, "html.parser")
-   
-    comments = soup.find_all(string=lambda text: isinstance(text, Comment))
-    
-    for comment in comments:
-        comment_soup = BeautifulSoup(comment, 'html.parser')  
-        div_injuries = comment_soup.find('div', class_='table_container', id='div_injuries')
-        if div_injuries:
-            injuries = div_injuries.find('tbody').find_all('a')
-            count = -1
-            reserves = []
-            for injury in injuries:
-                count += 1
-                if injury and count % 2 == 0:
-                    reserves.append(injury.get_text())
-            return reserves
-
-
-def scrape_injuries_from_date(date, home, away):
-    """Get injuries from date - from HTML."""
-    file = f"GAMES/{date}-{home}-{away}.html"
-
-    with open(file) as f:
-        page = f.read()
-
-    soup = BeautifulSoup(page, "html.parser")
-    inactives = soup.find('strong', text='Inactive:\xa0').find_parent('div').find_all('a')
-    injuries = []
-    for inactive in inactives:
-        injuries.append(inactive.get_text())
-    
-    return injuries
-
+# ===== INJURY/PLAYER-VALUE FUNCTIONS (DB-backed, replaces HTML parsing at request time) =====
 
 def get_player_value(ppg, rpg, apg, spg, bpg):
     """Calculate player value from stats."""
     return ppg + (1.2 * rpg) + (1.5 * apg) + (2 * spg) + (2 * bpg)
 
 
-def scrape_team_value(team):
-    """Get total team value from stats."""
-    file = f"TEAMS/{TEAM_TO_ABBR[team]}.html"
-    
-    with open(file) as f:
-        page = f.read()
-
-    soup = BeautifulSoup(page, "html.parser")
-    players = soup.find('table', id='per_game_stats').find('tbody').find_all('tr')
-
-    total = 0
-
-    for player in players:
-        ppg = float(player.find('td', attrs={'data-stat': 'pts_per_g'}).get_text())
-        rpg = float(player.find('td', attrs={'data-stat': 'trb_per_g'}).get_text())
-        apg = float(player.find('td', attrs={'data-stat': 'ast_per_g'}).get_text())
-        spg = float(player.find('td', attrs={'data-stat': 'stl_per_g'}).get_text())
-        bpg = float(player.find('td', attrs={'data-stat': 'blk_per_g'}).get_text())
-        total += get_player_value(ppg, rpg, apg, spg, bpg)
-        
-    return total
+@lru_cache(maxsize=64)
+def _team_player_values(team):
+    """Map of player -> (basic value, advanced value) from the team's latest scraped season."""
+    values = {}
+    for player, ppg, rpg, apg, spg, bpg, vorp, ws in get_latest_player_season_stats(team):
+        basic = get_player_value(ppg, rpg, apg, spg, bpg) if None not in (ppg, rpg, apg, spg, bpg) else None
+        advanced = (vorp * ws) if vorp is not None and ws is not None else None
+        values[player] = (basic, advanced)
+    return values
 
 
-def scrape_player_value(team, player_name):
-    """Get individual player value from stats."""
-    file = f"TEAMS/{TEAM_TO_ABBR[team]}.html"
-    
-    with open(file) as f:
-        page = f.read()
-
-    soup = BeautifulSoup(page, "html.parser")
-    players = soup.find('table', id='per_game_stats').find('tbody').find_all('tr')
-
-    for player in players:
-        name = player.find('td', attrs={'data-stat': 'name_display'}).find('a').get_text()
-        if name == player_name: 
-            ppg = float(player.find('td', attrs={'data-stat': 'pts_per_g'}).get_text())
-            rpg = float(player.find('td', attrs={'data-stat': 'trb_per_g'}).get_text())
-            apg = float(player.find('td', attrs={'data-stat': 'ast_per_g'}).get_text())
-            spg = float(player.find('td', attrs={'data-stat': 'stl_per_g'}).get_text())
-            bpg = float(player.find('td', attrs={'data-stat': 'blk_per_g'}).get_text())
-            value = get_player_value(ppg, rpg, apg, spg, bpg)
-            return value
+def get_injury_value(injured_players, team):
+    """Team's total player value minus injured players' value, from stored season stats."""
+    values = _team_player_values(team)
+    total_value = sum(basic for basic, _ in values.values() if basic is not None)
+    injury_value = sum(
+        values[player][0] for player in (injured_players or [])
+        if player in values and values[player][0] is not None
+    )
+    return total_value - injury_value
 
 
-def get_injury_value(injuries, team):
-    """Calculate injury impact using player value."""
-    injury_value = 0
-    total_value = scrape_team_value(team)
-    if injuries:
-        for injury in injuries:
-            player_value = scrape_player_value(team, injury)
-            if player_value:
-                injury_value += player_value
-    
-    return (total_value - injury_value)
+def get_injury_advanced(injured_players, team):
+    """Team's total advanced value (vorp*ws) minus injured players', from stored season stats."""
+    values = _team_player_values(team)
+    total_advanced = sum(advanced for _, advanced in values.values() if advanced is not None)
+    injury_advanced = sum(
+        values[player][1] for player in (injured_players or [])
+        if player in values and values[player][1] is not None
+    )
+    return total_advanced - injury_advanced
 
 
-def scrape_team_advanced(team):
-    """Get team advanced stats."""
-    file = f"TEAMS/{TEAM_TO_ABBR[team]}.html"
-
-    with open(file) as f:
-        page = f.read()
-    
-    soup = BeautifulSoup(page, "html.parser")
-
-    comments = soup.find_all(string=lambda text: isinstance(text, Comment))
-    
-    for comment in comments:
-        comment_soup = BeautifulSoup(comment, 'html.parser')  
-        advanced = comment_soup.find('table', id='advanced')
-        if advanced:
-            advanced = advanced.find('tbody').find_all('tr')
-            total = 0
-            for player in advanced:
-                vorp = float(player.find('td', attrs={'data-stat': 'vorp'}).get_text())
-                ws = float(player.find('td', attrs={'data-stat': 'ws'}).get_text())
-                total += (vorp * ws)
-
-            return total
+def get_current_team_injuries(team):
+    """Current live injury report for a team (from the DB, refreshed by pipeline/scrape_teams.py)."""
+    return get_current_injuries(team)
 
 
-def scrape_player_advanced(team, player_name):
-    """Get player advanced stats."""
-    file = f"TEAMS/{TEAM_TO_ABBR[team]}.html"
-
-    with open(file) as f:
-        page = f.read()
-    
-    soup = BeautifulSoup(page, "html.parser")
-
-    comments = soup.find_all(string=lambda text: isinstance(text, Comment))
-    
-    for comment in comments:
-        comment_soup = BeautifulSoup(comment, 'html.parser')  
-        advanced = comment_soup.find('table', id='advanced')
-        if advanced:
-            advanced = advanced.find('tbody').find_all('tr')
-            for player in advanced:
-                name = player.find('td', attrs={'data-stat': 'name_display'}).find('a').get_text()
-                if name == player_name:
-                    vorp = float(player.find('td', attrs={'data-stat': 'vorp'}).get_text())
-                    ws = float(player.find('td', attrs={'data-stat': 'ws'}).get_text())
-                    return vorp * ws
-
-
-def get_injury_advanced(injuries, team):
-    """Calculate injury impact using advanced analytics."""
-    injury_advanced = 0
-    total_advanced = scrape_team_advanced(team)
-    if injuries:
-        for injury in injuries:
-            player_advanced = scrape_player_advanced(team, injury)
-            if player_advanced:
-                injury_advanced += player_advanced
-    
-    return (total_advanced - injury_advanced)
-
-
-# ===== FOR TRAINING: Still need to parse game HTML for actual stats =====
-
-def scrape_team_metrics_from_game(date, home, away, metric_name):
-    """Extract metric from game HTML - used for training data."""
-    file = f"GAMES/{date}-{home}-{away}.html"
-
-    with open(file) as f:
-        page = f.read()
-
-    soup = BeautifulSoup(page, 'html.parser')
-    comments = soup.find_all(string=lambda text: isinstance(text, Comment))
-
-    for comment in comments:
-        comment_soup = BeautifulSoup(comment, 'html.parser')
-        div_four_factors = comment_soup.find('div', id='div_four_factors')
-        if div_four_factors:
-            away_or = float(div_four_factors.find('tbody').find_all('tr')[0].find('td', attrs={'data-stat': metric_name}).get_text())
-            home_or = float(div_four_factors.find('tbody').find_all('tr')[1].find('td', attrs={'data-stat': metric_name}).get_text())
-            return [home_or, away_or]

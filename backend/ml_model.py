@@ -1,24 +1,23 @@
 """ML model loading and prediction functions for API."""
 
 import pickle
-import os
 from datetime import datetime
 from functools import lru_cache
+from pathlib import Path
 
 # Import from current directory (backend folder)
 from config import TEAM_TO_ABBR
 from data import (
     get_input_format, get_avg_rtgs, get_avg_efgs, get_avg_tovs, get_avg_orbs,
-    scrape_team_injuries, get_injury_value, get_injury_advanced
+    get_current_team_injuries, get_injury_value, get_injury_advanced
 )
 
 # Paths - use local files
-MODEL_PATH = 'models/trained_model.pkl'
+MODEL_PATH = str(Path(__file__).resolve().parent / 'models' / 'trained_model.pkl')
 
-# Global cache for model and injuries
+# Global cache for the loaded model (injuries/player stats now come straight from the
+# DB, refreshed by pipeline/scrape_teams.py, so no separate request-time cache is needed)
 _model_cache = None
-_injury_cache = {}
-_injury_cache_time = {}
 
 
 def load_model():
@@ -37,29 +36,6 @@ def load_model():
         raise Exception(f"Model file not found at {MODEL_PATH}")
     except Exception as e:
         raise Exception(f"Failed to load model: {e}")
-
-
-def get_cached_injuries(team):
-    """Get injuries with caching (1 hour TTL)."""
-    global _injury_cache, _injury_cache_time
-    
-    now = datetime.now()
-    
-    # Check if cached and still fresh (1 hour)
-    if team in _injury_cache:
-        cache_age = (now - _injury_cache_time[team]).seconds
-        if cache_age < 3600:  # 1 hour cache
-            return _injury_cache[team]
-    
-    # Cache miss or stale - fetch fresh data
-    try:
-        injuries = scrape_team_injuries(team)
-        _injury_cache[team] = injuries
-        _injury_cache_time[team] = now
-        return injuries
-    except Exception as e:
-        print(f"Error fetching injuries for {team}: {e}")
-        return []
 
 
 @lru_cache(maxsize=128)
@@ -117,16 +93,16 @@ def predict_game_outcome(home_team, away_team, model_data, date=None):
     # Get cached team stats
     stats = get_cached_team_stats(prediction_date, home_team, away_team)
     
-    # Get cached injuries
-    home_injuries = get_cached_injuries(home_team)
-    away_injuries = get_cached_injuries(away_team)
-    
+    # Get current injuries (from the DB, refreshed by pipeline/scrape_teams.py)
+    home_injuries = get_current_team_injuries(home_team)
+    away_injuries = get_current_team_injuries(away_team)
+
     home_injury_value = get_injury_value(home_injuries, home_team)
     away_injury_value = get_injury_value(away_injuries, away_team)
-    
+
     home_injury_advanced = get_injury_advanced(home_injuries, home_team)
     away_injury_advanced = get_injury_advanced(away_injuries, away_team)
-    
+
     # Build input
     import pandas as pd
     input_data = { 
@@ -154,14 +130,6 @@ def predict_game_outcome(home_team, away_team, model_data, date=None):
     confidence_value = max(confidence)
     
     return winner, confidence_value
-
-
-def clear_injury_cache():
-    """Clear injury cache (call this from a scheduled endpoint)."""
-    global _injury_cache, _injury_cache_time
-    _injury_cache = {}
-    _injury_cache_time = {}
-    return True
 
 
 def get_model_info(model_data):
@@ -194,13 +162,13 @@ def get_team_comparison_stats(home_team, away_team, date=None):
     # Get cached stats
     stats = get_cached_team_stats(prediction_date, home_team, away_team)
     
-    # Get cached injuries
-    home_injuries = get_cached_injuries(home_team)
-    away_injuries = get_cached_injuries(away_team)
-    
+    # Get current injuries (from the DB, refreshed by pipeline/scrape_teams.py)
+    home_injuries = get_current_team_injuries(home_team)
+    away_injuries = get_current_team_injuries(away_team)
+
     home_injury_value = get_injury_value(home_injuries, home_team)
     away_injury_value = get_injury_value(away_injuries, away_team)
-    
+
     # Determine advantages
     def get_advantage(home_val, away_val, lower_is_better=False):
         if abs(home_val - away_val) < 0.1:

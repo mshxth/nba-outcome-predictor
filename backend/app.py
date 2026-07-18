@@ -25,6 +25,7 @@ def root():
             "GET /api/teams": "List all NBA teams",
             "GET /api/predict": "Predict game outcome (params: home, away, date)",
             "GET /api/stats": "Model statistics",
+            "GET /api/team-comparison": "Detailed team comparison stats (params: home, away, date)",
             "GET /health": "Health check"
         }
     })
@@ -142,17 +143,6 @@ def get_team_comparison():
         return jsonify({"error": str(e)}), 400
     except Exception as e:
         return jsonify({"error": f"Failed to get stats: {str(e)}"}), 500
-
-@app.route('/api/refresh-cache', methods=['POST'])
-def refresh_cache():
-    """Refresh injury cache (call this daily)."""
-    from ml_model import clear_injury_cache
-    
-    try:
-        clear_injury_cache()
-        return jsonify({"message": "Cache cleared successfully"})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 @app.errorhandler(404)
 def not_found(e):
