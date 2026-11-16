@@ -33,7 +33,20 @@ TEAM_TO_ABBR = {
     "San Antonio": "SAS",
     "Toronto": "TOR",
     "Utah": "UTA",
-    "Washington": "WAS"
+    "Washington": "WAS",
+    # Historical-only franchise names (relocated/renamed since 2007-08) --
+    # needed to backfill seasons before the moves below. See
+    # pipeline/utils.py:historical_abbr for the date-based overrides this
+    # doesn't cover (Charlotte and New Orleans kept their city name but
+    # changed abbreviation).
+    "Seattle": "SEA",       # -> Oklahoma City Thunder, 2008-09
+    "New Jersey": "NJN",    # -> Brooklyn Nets, 2012-13
+    # New Orleans Hornets played as a displaced dual-city franchise for two
+    # seasons after Hurricane Katrina (2005-06, 2006-07) before returning to
+    # New Orleans full-time in 2007-08 -- a genuinely distinct team identity
+    # on basketball-reference, not just a renamed abbreviation.
+    "New Orleans/Oklahoma City": "NOK",
+    "Vancouver": "VAN",     # -> Memphis Grizzlies, 2001-02
 }
 
 
@@ -44,29 +57,16 @@ TEAMS = "https://www.basketball-reference.com/teams/"
 
 
 # Date utility functions
-def get_last_7_days_from_date(date):
+def get_last_n_days_from_date(date, n):
     date = datetime.strptime(date, '%Y-%m-%d')
-    last_7_days = [(date - timedelta(days=i+1)).strftime('%Y-%m-%d') for i in range(7)]
-    return last_7_days
+    return [(date - timedelta(days=i + 1)).strftime('%Y-%m-%d') for i in range(n)]
 
-def get_last_15_days_from_date(date):
-    date = datetime.strptime(date, '%Y-%m-%d')
-    last_15_days = [(date - timedelta(days=i+1)).strftime('%Y-%m-%d') for i in range(15)]
-    return last_15_days
 
-def get_last_30_days_from_date(date):
-    date = datetime.strptime(date, '%Y-%m-%d')
-    last_30_days = [(date - timedelta(days=i+1)).strftime('%Y-%m-%d') for i in range(30)]
-    return last_30_days
-
-def get_2023_2024_season_dates():
-    start_date = datetime(2023, 10, 24)
-    end_date = datetime(2024, 4, 14)
-    date_range = [(start_date + timedelta(days=i)).strftime('%Y-%m-%d') for i in range((end_date - start_date).days + 1)]
-    return date_range
-
-def get_2024_2025_season_dates():
-    start_date = datetime(2024, 10, 22)
-    end_date = datetime(2025, 4, 13)
-    date_range = [(start_date + timedelta(days=i)).strftime('%Y-%m-%d') for i in range((end_date - start_date).days + 1)]
-    return date_range
+def get_season_start_date(date):
+    """A safe lower bound for 'this season so far' as of `date` -- August 1 of the
+    season's start year (NBA seasons start mid-to-late October at the earliest,
+    so this comfortably predates any real games while staying within the same season).
+    """
+    d = datetime.strptime(date, '%Y-%m-%d')
+    start_year = d.year if d.month >= 10 else d.year - 1
+    return f'{start_year}-08-01'

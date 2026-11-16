@@ -1,9 +1,11 @@
 """SQLite database functions for NBA predictor."""
 
+import os
 import sqlite3
 from pathlib import Path
 
-DB_PATH = str(Path(__file__).resolve().parent / 'data' / 'nba_data.db')
+# NBA_DB_PATH points offline evaluation at a larger database kept outside the repo
+DB_PATH = os.environ.get('NBA_DB_PATH') or str(Path(__file__).resolve().parent / 'data' / 'nba_data.db')
 
 
 def create_database():
@@ -55,25 +57,6 @@ def create_database():
         )
     ''')
 
-    # Player season stats table - per-game and advanced averages, refreshed periodically
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS player_season_stats (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team TEXT NOT NULL,
-            player TEXT NOT NULL,
-            season TEXT NOT NULL,
-            ppg REAL,
-            rpg REAL,
-            apg REAL,
-            spg REAL,
-            bpg REAL,
-            vorp REAL,
-            ws REAL,
-            scraped_at TEXT NOT NULL,
-            UNIQUE(team, player, season)
-        )
-    ''')
-
     # Current injuries table - live injury report per team, refreshed by the scheduled scraper
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS current_injuries (
@@ -84,9 +67,35 @@ def create_database():
         )
     ''')
 
+    # Player game stats table - full per-player basic + advanced box score line for
+    # every player who recorded minutes in a game (not just season aggregates)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS player_game_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            game_id INTEGER NOT NULL,
+            team TEXT NOT NULL,
+            player TEXT NOT NULL,
+            minutes REAL,
+            fg REAL, fga REAL, fg_pct REAL,
+            fg3 REAL, fg3a REAL, fg3_pct REAL,
+            ft REAL, fta REAL, ft_pct REAL,
+            orb REAL, drb REAL, trb REAL,
+            ast REAL, stl REAL, blk REAL, tov REAL, pf REAL, pts REAL,
+            game_score REAL, plus_minus REAL,
+            ts_pct REAL, efg_pct REAL,
+            fg3a_per_fga_pct REAL, fta_per_fga_pct REAL,
+            orb_pct REAL, drb_pct REAL, trb_pct REAL,
+            ast_pct REAL, stl_pct REAL, blk_pct REAL, tov_pct REAL,
+            usg_pct REAL, off_rtg REAL, def_rtg REAL, bpm REAL,
+            FOREIGN KEY (game_id) REFERENCES games(id),
+            UNIQUE(game_id, team, player)
+        )
+    ''')
+
     # Create indexes for faster queries
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_games_date ON games(date)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_games_teams ON games(home_team, away_team)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_game_stats_game ON player_game_stats(game_id)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_team_stats_team ON team_stats(team)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_team_stats_game ON team_stats(game_id)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_game_injuries_team ON game_injuries(team)')
@@ -167,54 +176,41 @@ def insert_game_injuries(game_id, team, players):
     conn.close()
 
 
-def upsert_player_season_stats(team, player, season, ppg, rpg, apg, spg, bpg, vorp, ws, scraped_at):
-    """Insert or update a player's season stats (keyed on team, player, season)."""
+def insert_player_game_stats(game_id, team, player, stats):
+    """Insert a player's per-game box score line (idempotent via UNIQUE constraint).
+
+    `stats` is a dict keyed by the same column names as the `player_game_stats`
+    table (minutes, fg, fga, ..., off_rtg, def_rtg, bpm) -- see
+    pipeline/parsers.py:parse_player_game_stats.
+    """
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    cursor.execute('''
-        INSERT INTO player_season_stats (team, player, season, ppg, rpg, apg, spg, bpg, vorp, ws, scraped_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(team, player, season) DO UPDATE SET
-            ppg=excluded.ppg, rpg=excluded.rpg, apg=excluded.apg, spg=excluded.spg, bpg=excluded.bpg,
-            vorp=excluded.vorp, ws=excluded.ws, scraped_at=excluded.scraped_at
-    ''', (team, player, season, ppg, rpg, apg, spg, bpg, vorp, ws, scraped_at))
+    columns = [
+        'minutes', 'fg', 'fga', 'fg_pct', 'fg3', 'fg3a', 'fg3_pct', 'ft', 'fta', 'ft_pct',
+        'orb', 'drb', 'trb', 'ast', 'stl', 'blk', 'tov', 'pf', 'pts', 'game_score', 'plus_minus',
+        'ts_pct', 'efg_pct', 'fg3a_per_fga_pct', 'fta_per_fga_pct', 'orb_pct', 'drb_pct', 'trb_pct',
+        'ast_pct', 'stl_pct', 'blk_pct', 'tov_pct', 'usg_pct', 'off_rtg', 'def_rtg', 'bpm',
+    ]
+    placeholders = ', '.join('?' * (len(columns) + 3))
+    cursor.execute(f'''
+        INSERT OR IGNORE INTO player_game_stats (game_id, team, player, {', '.join(columns)})
+        VALUES ({placeholders})
+    ''', (game_id, team, player, *[stats.get(c) for c in columns]))
 
     conn.commit()
     conn.close()
 
 
-def get_player_season_stats(team, season):
-    """Get all player season stats for a team/season."""
+def player_game_stats_exist(game_id):
+    """Check whether a game already has per-player stats stored (backfill resume check)."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    cursor.execute('''
-        SELECT player, ppg, rpg, apg, spg, bpg, vorp, ws
-        FROM player_season_stats WHERE team = ? AND season = ?
-    ''', (team, season))
-
-    results = cursor.fetchall()
+    cursor.execute('SELECT 1 FROM player_game_stats WHERE game_id = ? LIMIT 1', (game_id,))
+    result = cursor.fetchone()
     conn.close()
-    return results
-
-
-def get_latest_player_season_stats(team):
-    """Get player season stats for a team's most recently scraped season."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    cursor.execute('''
-        SELECT player, ppg, rpg, apg, spg, bpg, vorp, ws
-        FROM player_season_stats
-        WHERE team = ? AND season = (
-            SELECT season FROM player_season_stats WHERE team = ? ORDER BY scraped_at DESC LIMIT 1
-        )
-    ''', (team, team))
-
-    results = cursor.fetchall()
-    conn.close()
-    return results
+    return result is not None
 
 
 def get_game_injuries(game_id, team):
@@ -298,24 +294,42 @@ def get_team_stats_for_dates(team, dates, metric_name):
     # Return in order of input dates
     for date in dates:
         metrics.append(date_dict[date])
-    
+
     return metrics
 
 
-def get_all_dates_for_team(team):
-    """Get all dates where team played."""
+def get_team_player_stats_for_dates(team, dates):
+    """Get every player's per-game (minutes, pts, trb, ast, stl, blk, bpm) line for a team across specific dates."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
+
+    placeholders = ','.join('?' * len(dates))
+    cursor.execute(f'''
+        SELECT p.player, p.minutes, p.pts, p.trb, p.ast, p.stl, p.blk, p.bpm
+        FROM player_game_stats p
+        JOIN games g ON p.game_id = g.id
+        WHERE p.team = ? AND g.date IN ({placeholders})
+    ''', [team] + dates)
+
+    results = cursor.fetchall()
+    conn.close()
+    return results
+
+
+def get_team_player_stats_for_season(team, season_start_date, before_date):
+    """Get every player's per-game (minutes, pts, trb, ast, stl, blk, bpm) line for a team,
+    for every game from season_start_date up to (not including) before_date."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
     cursor.execute('''
-        SELECT DISTINCT g.date
-        FROM team_stats ts
-        JOIN games g ON ts.game_id = g.id
-        WHERE ts.team = ?
-        ORDER BY g.date
-    ''', (team,))
-    
-    results = [row[0] for row in cursor.fetchall()]
+        SELECT p.player, p.minutes, p.pts, p.trb, p.ast, p.stl, p.blk, p.bpm
+        FROM player_game_stats p
+        JOIN games g ON p.game_id = g.id
+        WHERE p.team = ? AND g.date >= ? AND g.date < ?
+    ''', (team, season_start_date, before_date))
+
+    results = cursor.fetchall()
     conn.close()
     return results
 

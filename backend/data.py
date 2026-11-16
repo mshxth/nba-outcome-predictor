@@ -2,10 +2,11 @@
 
 from datetime import datetime, timedelta
 from functools import lru_cache
-from config import get_last_30_days_from_date, get_last_7_days_from_date
+from config import get_last_n_days_from_date, get_season_start_date
 from database import (
     get_team_stats_for_dates, get_home_win, check_back_to_back,
-    get_latest_player_season_stats, get_current_injuries, get_game_injuries,
+    get_team_player_stats_for_dates, get_team_player_stats_for_season,
+    get_current_injuries, get_game_injuries,
 )
 
 
@@ -91,22 +92,25 @@ def scrape_back_to_back(date, home, away):
     return homeb2b, awayb2b
 
 
-def get_input_format(date, home, away, func):
-    """Helper function to get proper format for input."""
-    home_30_days_avgs = func(get_last_30_days_from_date(date), home)
-    away_30_days_avgs = func(get_last_30_days_from_date(date), away)
-    home_30_days = (home_30_days_avgs[0] + away_30_days_avgs[1]) / 2
-    away_30_days = (away_30_days_avgs[0] + home_30_days_avgs[1]) / 2
+def get_input_format(date, home, away, func, windows=(7, 30)):
+    """Helper function to get proper format for input.
 
-    home_7_days_avgs = func(get_last_7_days_from_date(date), home)
-    away_7_days_avgs = func(get_last_7_days_from_date(date), away)
-    home_7_days = (home_7_days_avgs[0] + away_7_days_avgs[1]) / 2
-    away_7_days = (away_7_days_avgs[0] + home_7_days_avgs[1]) / 2 
-  
-    home_ret = (home_30_days + home_7_days) / 2
-    away_ret = (away_30_days + away_7_days) / 2
-   
-    return home_ret, away_ret
+    For each window size (days), blends each team's own rolling average with
+    the opponent's rolling "allowed" average, then averages the result across
+    all given window sizes. Defaults to (7, 30) to match live serving; pass a
+    different set of windows (e.g. just (15,) or (7, 15, 30)) to experiment
+    with how much history the model should look back over.
+    """
+    home_vals = []
+    away_vals = []
+    for window in windows:
+        dates = get_last_n_days_from_date(date, window)
+        home_avgs = func(dates, home)
+        away_avgs = func(dates, away)
+        home_vals.append((home_avgs[0] + away_avgs[1]) / 2)
+        away_vals.append((away_avgs[0] + home_avgs[1]) / 2)
+
+    return sum(home_vals) / len(home_vals), sum(away_vals) / len(away_vals)
 
 
 # ===== INJURY/PLAYER-VALUE FUNCTIONS (DB-backed, replaces HTML parsing at request time) =====
@@ -116,37 +120,111 @@ def get_player_value(ppg, rpg, apg, spg, bpg):
     return ppg + (1.2 * rpg) + (1.5 * apg) + (2 * spg) + (2 * bpg)
 
 
-@lru_cache(maxsize=64)
-def _team_player_values(team):
-    """Map of player -> (basic value, advanced value) from the team's latest scraped season."""
+# Garbage-time appearances (a few seconds of court time) produce degenerate rate
+# stats -- e.g. usg_pct=100 or bpm=+/-1000 for a single-possession cameo -- that
+# are pure noise, not signal, about a player's real value. Excluded from every
+# player-value aggregation below.
+MIN_MINUTES_GARBAGE_TIME = 3.0
+
+
+def _aggregate_player_values(rows, min_minutes=MIN_MINUTES_GARBAGE_TIME):
+    """Aggregate (player, minutes, pts, trb, ast, stl, blk, bpm) rows into
+    {player: (basic value, advanced value)}, dropping garbage-time appearances.
+
+    Basic value is get_player_value() over each player's average pts/trb/ast/stl/blk
+    across the given rows. Advanced value is average BPM (Box Plus-Minus) -- the
+    per-game stat VORP is itself derived from, since VORP/Win Shares are
+    season-cumulative and have no per-game equivalent.
+    """
+    by_player = {}
+    for player, minutes, pts, trb, ast, stl, blk, bpm in rows:
+        if minutes is None or minutes < min_minutes:
+            continue
+        by_player.setdefault(player, {'pts': [], 'trb': [], 'ast': [], 'stl': [], 'blk': [], 'bpm': []})
+        for key, val in (('pts', pts), ('trb', trb), ('ast', ast), ('stl', stl), ('blk', blk), ('bpm', bpm)):
+            if val is not None:
+                by_player[player][key].append(val)
+
     values = {}
-    for player, ppg, rpg, apg, spg, bpg, vorp, ws in get_latest_player_season_stats(team):
-        basic = get_player_value(ppg, rpg, apg, spg, bpg) if None not in (ppg, rpg, apg, spg, bpg) else None
-        advanced = (vorp * ws) if vorp is not None and ws is not None else None
+    for player, stats in by_player.items():
+        basic = advanced = None
+        if stats['pts']:
+            avg = {k: sum(v) / len(v) if v else 0 for k, v in stats.items()}
+            basic = get_player_value(avg['pts'], avg['trb'], avg['ast'], avg['stl'], avg['blk'])
+        if stats['bpm']:
+            advanced = sum(stats['bpm']) / len(stats['bpm'])
         values[player] = (basic, advanced)
     return values
 
 
-def get_injury_value(injured_players, team):
-    """Team's total player value minus injured players' value, from stored season stats."""
-    values = _team_player_values(team)
-    total_value = sum(basic for basic, _ in values.values() if basic is not None)
-    injury_value = sum(
-        values[player][0] for player in (injured_players or [])
-        if player in values and values[player][0] is not None
-    )
-    return total_value - injury_value
+@lru_cache(maxsize=256)
+def _team_rolling_player_values(team, date, windows=(7, 30)):
+    """Map of player -> (basic value, advanced value) from rolling pre-game per-game stats,
+    blended across window sizes exactly like the four-factor rolling stats in
+    get_input_format -- automatically point-in-time correct for any historical date.
+    """
+    basic_by_window = []
+    advanced_by_window = []
+
+    for window in windows:
+        dates = get_last_n_days_from_date(date, window)
+        rows = get_team_player_stats_for_dates(team, dates)
+        window_values = _aggregate_player_values(rows)
+        basic_by_window.append({p: v[0] for p, v in window_values.items() if v[0] is not None})
+        advanced_by_window.append({p: v[1] for p, v in window_values.items() if v[1] is not None})
+
+    all_players = set().union(*basic_by_window, *advanced_by_window)
+    values = {}
+    for player in all_players:
+        basics = [d[player] for d in basic_by_window if player in d]
+        advanceds = [d[player] for d in advanced_by_window if player in d]
+        values[player] = (
+            sum(basics) / len(basics) if basics else None,
+            sum(advanceds) / len(advanceds) if advanceds else None,
+        )
+    return values
 
 
-def get_injury_advanced(injured_players, team):
-    """Team's total advanced value (vorp*ws) minus injured players', from stored season stats."""
-    values = _team_player_values(team)
-    total_advanced = sum(advanced for _, advanced in values.values() if advanced is not None)
-    injury_advanced = sum(
-        values[player][1] for player in (injured_players or [])
-        if player in values and values[player][1] is not None
+@lru_cache(maxsize=256)
+def _team_season_player_values(team, date):
+    """Map of player -> (basic value, advanced value) from season-to-date per-game stats
+    (season start through the day before `date`) instead of a rolling window -- tests
+    whether a season-long average, smoother/less noisy than the 7/30-day rolling blend,
+    makes for a better injury-impact signal.
+    """
+    season_start = get_season_start_date(date)
+    rows = get_team_player_stats_for_season(team, season_start, date)
+    return _aggregate_player_values(rows)
+
+
+def _value_delta(values, injured_players, idx):
+    """Team's total value (basic if idx=0, advanced if idx=1) minus injured players' value."""
+    total = sum(v[idx] for v in values.values() if v[idx] is not None)
+    injured = sum(
+        values[player][idx] for player in (injured_players or [])
+        if player in values and values[player][idx] is not None
     )
-    return total_advanced - injury_advanced
+    return total - injured
+
+
+def get_injury_value(injured_players, team, date, windows=(7, 30)):
+    """Team's total rolling player value minus injured players' value."""
+    return _value_delta(_team_rolling_player_values(team, date, windows), injured_players, 0)
+
+
+def get_injury_advanced(injured_players, team, date, windows=(7, 30)):
+    """Team's total rolling advanced value (avg BPM) minus injured players'."""
+    return _value_delta(_team_rolling_player_values(team, date, windows), injured_players, 1)
+
+
+def get_injury_value_season(injured_players, team, date):
+    """Team's total season-to-date player value minus injured players' value."""
+    return _value_delta(_team_season_player_values(team, date), injured_players, 0)
+
+
+def get_injury_advanced_season(injured_players, team, date):
+    """Team's total season-to-date advanced value (avg BPM) minus injured players'."""
+    return _value_delta(_team_season_player_values(team, date), injured_players, 1)
 
 
 def get_current_team_injuries(team):

@@ -68,76 +68,86 @@ def parse_inactive_players(html):
                 current_abbr = abbr_strong.get_text(strip=True)
                 inactives.setdefault(current_abbr, [])
         elif el.name == 'a' and current_abbr:
-            inactives[current_abbr].append(el.get_text(strip=True))
+            name = el.get_text(strip=True)
+            # basketball-reference sometimes links an inactive player to a
+            # placeholder "tmp-<id>" page (e.g. a recent two-way/G-League
+            # call-up without a full player page yet) with no link text.
+            if name:
+                inactives[current_abbr].append(name)
 
     return inactives
 
 
-def parse_team_roster(html):
-    """Parse a team page's roster. Returns a list of player names."""
-    soup = BeautifulSoup(html, "html.parser")
-
-    roster = []
-    roster_data = soup.find('div', id='div_roster').find_all('tr')
-    for player_data in roster_data:
-        player = player_data.find('td', attrs={'data-stat': 'player'})
-        if player:
-            roster.append(player.find_all('a')[0].get_text())
-
-    return roster
+_BASIC_BOX_STAT_KEYS = [
+    'fg', 'fga', 'fg_pct', 'fg3', 'fg3a', 'fg3_pct', 'ft', 'fta', 'ft_pct',
+    'orb', 'drb', 'trb', 'ast', 'stl', 'blk', 'tov', 'pf', 'pts', 'game_score', 'plus_minus',
+]
+_ADVANCED_BOX_STAT_KEYS = [
+    'ts_pct', 'efg_pct', 'fg3a_per_fga_pct', 'fta_per_fga_pct', 'orb_pct', 'drb_pct', 'trb_pct',
+    'ast_pct', 'stl_pct', 'blk_pct', 'tov_pct', 'usg_pct', 'off_rtg', 'def_rtg', 'bpm',
+]
 
 
-def parse_team_per_game_stats(html):
-    """Parse a team page's per-game stats table.
+def _parse_box_table(html, table_id, stat_keys):
+    """Parse one team's basic or advanced per-player box score table.
 
-    Returns {player_name: {'ppg':.., 'rpg':.., 'apg':.., 'spg':.., 'bpg':..}}.
+    Returns {player_name: {'minutes': float or None, key: float or None, ...}}.
+    Skips the mid-table "Reserves" separator row (no player link) and DNP rows
+    (a `data-stat="reason"` cell instead of real stats) -- neither has a stat line to store.
     """
-    soup = BeautifulSoup(html, "html.parser")
-    players = soup.find('table', id='per_game_stats').find('tbody').find_all('tr')
+    soup = BeautifulSoup(html, 'html.parser')
+    table = soup.find('table', id=table_id)
+    if table is None:
+        return {}
 
-    stats = {}
-    for player in players:
-        name_cell = player.find('td', attrs={'data-stat': 'name_display'})
-        if not name_cell or not name_cell.find('a'):
+    players = {}
+    for row in table.find('tbody').find_all('tr'):
+        player_cell = row.find('th', attrs={'data-stat': 'player'})
+        if not player_cell or not player_cell.find('a'):
             continue
-        name = name_cell.find('a').get_text()
-        stats[name] = {
-            'ppg': float(player.find('td', attrs={'data-stat': 'pts_per_g'}).get_text()),
-            'rpg': float(player.find('td', attrs={'data-stat': 'trb_per_g'}).get_text()),
-            'apg': float(player.find('td', attrs={'data-stat': 'ast_per_g'}).get_text()),
-            'spg': float(player.find('td', attrs={'data-stat': 'stl_per_g'}).get_text()),
-            'bpg': float(player.find('td', attrs={'data-stat': 'blk_per_g'}).get_text()),
-        }
+        if row.find('td', attrs={'data-stat': 'reason'}):
+            continue
+        player = player_cell.find('a').get_text(strip=True)
 
-    return stats
+        mp_cell = row.find('td', attrs={'data-stat': 'mp'})
+        mp_text = mp_cell.get_text(strip=True) if mp_cell else ''
+        minutes = None
+        if ':' in mp_text:
+            mins, secs = mp_text.split(':')
+            minutes = int(mins) + int(secs) / 60
+
+        stats = {'minutes': minutes}
+        for key in stat_keys:
+            cell = row.find('td', attrs={'data-stat': key})
+            text = cell.get_text(strip=True) if cell else ''
+            stats[key] = float(text) if text else None
+        players[player] = stats
+
+    return players
 
 
-def parse_team_advanced_stats(html):
-    """Parse a team page's advanced stats table (VORP, WS), hidden in an HTML comment.
+def parse_player_game_stats(html, home_abbr, away_abbr):
+    """Parse both teams' full per-player basic + advanced box score lines from a box score page.
 
-    Returns {player_name: {'vorp':.., 'ws':..}}.
+    Returns {'home': [{'player': .., 'minutes': .., ...all stat keys}, ...], 'away': [...]}.
+    Only includes players who actually recorded minutes (DNPs are skipped -- the
+    pregame inactive list is separately and correctly tracked via parse_inactive_players).
     """
-    soup = BeautifulSoup(html, "html.parser")
-    comments = soup.find_all(string=lambda text: isinstance(text, Comment))
+    result = {}
+    for side, abbr in (('home', home_abbr), ('away', away_abbr)):
+        basic = _parse_box_table(html, f'box-{abbr}-game-basic', _BASIC_BOX_STAT_KEYS)
+        advanced = _parse_box_table(html, f'box-{abbr}-game-advanced', _ADVANCED_BOX_STAT_KEYS)
 
-    for comment in comments:
-        comment_soup = BeautifulSoup(comment, 'html.parser')
-        advanced = comment_soup.find('table', id='advanced')
-        if advanced:
-            rows = advanced.find('tbody').find_all('tr')
-            stats = {}
-            for player in rows:
-                name_cell = player.find('td', attrs={'data-stat': 'name_display'})
-                if not name_cell or not name_cell.find('a'):
-                    continue
-                name = name_cell.find('a').get_text()
-                stats[name] = {
-                    'vorp': float(player.find('td', attrs={'data-stat': 'vorp'}).get_text()),
-                    'ws': float(player.find('td', attrs={'data-stat': 'ws'}).get_text()),
-                }
-            return stats
+        rows = []
+        for player, stats in basic.items():
+            row = {'player': player, **stats}
+            adv = dict(advanced.get(player, {}))
+            adv.pop('minutes', None)  # duplicate of basic table's minutes
+            row.update(adv)
+            rows.append(row)
+        result[side] = rows
 
-    return {}
+    return result
 
 
 def parse_team_injuries(html):
