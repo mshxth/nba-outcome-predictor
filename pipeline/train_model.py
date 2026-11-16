@@ -1,150 +1,81 @@
-"""Train the Random Forest game-outcome model directly from SQLite.
+"""Train a game-outcome model from SQLite using the same features as model_comparison.py.
 
-Reproduces the notebook's original feature-building and training
-methodology exactly (see NBA.ipynb cells 46/50/53 -- this script doesn't
-change the modeling approach, only where the data comes from):
-  - training features (2023-24 season) use each game's own raw four-factor
-    stats
-  - test features (2024-25 season) use rolling 7/30-day averages, the same
-    as live serving
-  - both use each game's actual per-game injury list (game_injuries table)
+Features (14) are built by model_comparison.build_season, so training and the
+comparison harness cannot drift apart. Every feature uses only days BEFORE the
+game date (rolling 7/30-day four factors, point-in-time injury value, back-to-back).
+
+Two steps:
+  1. Fit on every season before the last one, score on the last complete season
+     (a held-out check, same as one walk-forward fold).
+  2. Refit on all seasons through the last one and save that model.
+
+The default model is plain logistic regression: in results/SUMMARY.md it tied or
+beat every other single model. Use --model rf for the original random forest.
+
+The saved pickle goes to results/trained_model.pkl by default. It is NOT written
+to backend/models/ (the deployed model) unless you pass --out for that path.
 
 Usage:
-    python3 pipeline/train_model.py
+    NBA_DB_PATH=/path/to/full.db python3 pipeline/train_model.py [--model lr|rf] [--out PATH]
 """
 
+import argparse
 import pickle
-import sqlite3
 import sys
 from pathlib import Path
 
-import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / 'backend'))
+sys.path.insert(0, str(REPO_ROOT / 'pipeline'))
 
-import database
-from config import get_2023_2024_season_dates, get_2024_2025_season_dates
-from data import (
-    get_avg_rtgs, get_avg_efgs, get_avg_tovs, get_avg_orbs, get_input_format,
-    get_injury_value, get_injury_advanced,
-)
+import model_comparison as mc
 
-MODEL_PATH = REPO_ROOT / 'backend' / 'models' / 'trained_model.pkl'
-
-FEATURE_COLUMNS = [
-    'Home ORtg', 'Away ORtg', 'Home eFG%', 'Away eFG%',
-    'Home TOV%', 'Away TOV%', 'Home ORB%', 'Away ORB%',
-    'Home Injury Value', 'Away Injury Value',
-    'Home Injury Advanced', 'Away Injury Advanced',
-]
+DEFAULT_OUT = REPO_ROOT / 'results' / 'trained_model.pkl'
+SEED = mc.SEED
 
 
-def _games_in_range(dates):
-    conn = sqlite3.connect(database.DB_PATH)
-    cursor = conn.cursor()
-    placeholders = ','.join('?' * len(dates))
-    cursor.execute(f'''
-        SELECT id, date, home_team, away_team, home_win
-        FROM games WHERE date IN ({placeholders})
-        ORDER BY date
-    ''', dates)
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
+def make_model(kind):
+    if kind == 'rf':
+        return RandomForestClassifier(n_estimators=100, random_state=SEED, n_jobs=-1)
+    return make_pipeline(LogisticRegression(max_iter=1000))
 
 
-def _raw_four_factors(game_id, team):
-    conn = sqlite3.connect(database.DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT off_rtg, efg_pct, tov_pct, orb_pct FROM team_stats
-        WHERE game_id = ? AND team = ?
-    ''', (game_id, team))
-    row = cursor.fetchone()
-    conn.close()
-    return row
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', choices=['lr', 'rf'], default='lr')
+    parser.add_argument('--out', type=Path, default=DEFAULT_OUT)
+    parser.add_argument('--workers', type=int, default=4)
+    args = parser.parse_args()
 
+    df, _ = mc.load_features(args.workers)
+    test_season = mc.LAST_SEASON
+    train = df[df['season'] < test_season]
+    test = df[df['season'] == test_season]
+    cols = mc.FEATURE_COLUMNS
 
-def _injury_features(game_id, home, away):
-    home_injuries = database.get_game_injuries(game_id, home)
-    away_injuries = database.get_game_injuries(game_id, away)
-    return {
-        'Home Injury Value': get_injury_value(home_injuries, home),
-        'Away Injury Value': get_injury_value(away_injuries, away),
-        'Home Injury Advanced': get_injury_advanced(home_injuries, home),
-        'Away Injury Advanced': get_injury_advanced(away_injuries, away),
-    }
+    model = make_model(args.model).fit(train[cols], train['Home Win'])
+    m = mc.metrics(test['Home Win'], model.predict_proba(test[cols])[:, 1])
+    print(f'{args.model}: trained on {len(train)} games before {test_season}, '
+          f'tested on {len(test)} games in {test_season}')
+    print(f"  log loss {m['logloss']:.4f}  brier {m['brier']:.4f}  accuracy {m['acc'] * 100:.2f}%")
 
-
-def build_training_rows():
-    rows = []
-    for game_id, date, home, away, home_win in _games_in_range(get_2023_2024_season_dates()):
-        home_stats = _raw_four_factors(game_id, home)
-        away_stats = _raw_four_factors(game_id, away)
-        if not home_stats or not away_stats:
-            continue
-
-        rows.append({
-            'Home ORtg': home_stats[0], 'Away ORtg': away_stats[0],
-            'Home eFG%': home_stats[1], 'Away eFG%': away_stats[1],
-            'Home TOV%': home_stats[2], 'Away TOV%': away_stats[2],
-            'Home ORB%': home_stats[3], 'Away ORB%': away_stats[3],
-            **_injury_features(game_id, home, away),
-            'Home Win': home_win,
-        })
-    return pd.DataFrame(rows)
-
-
-def build_test_rows():
-    rows = []
-    for game_id, date, home, away, home_win in _games_in_range(get_2024_2025_season_dates()):
-        try:
-            home_rtg, away_rtg = get_input_format(date, home, away, get_avg_rtgs)
-            home_efg, away_efg = get_input_format(date, home, away, get_avg_efgs)
-            home_tov, away_tov = get_input_format(date, home, away, get_avg_tovs)
-            home_orb, away_orb = get_input_format(date, home, away, get_avg_orbs)
-        except Exception:
-            continue
-
-        rows.append({
-            'Home ORtg': home_rtg, 'Away ORtg': away_rtg,
-            'Home eFG%': home_efg, 'Away eFG%': away_efg,
-            'Home TOV%': home_tov, 'Away TOV%': away_tov,
-            'Home ORB%': home_orb, 'Away ORB%': away_orb,
-            **_injury_features(game_id, home, away),
-            'Home Win': home_win,
-        })
-    return pd.DataFrame(rows)
+    final = make_model(args.model).fit(df[cols], df['Home Win'])
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    with open(args.out, 'wb') as f:
+        pickle.dump({
+            'model': final,
+            'kind': args.model,
+            'accuracy': m['acc'],
+            'logloss': m['logloss'],
+            'features': cols,
+            'trained_through': mc.LAST_SEASON,
+        }, f)
+    print(f'Refit on {len(df)} games through {mc.LAST_SEASON}; model written to {args.out}')
 
 
 if __name__ == '__main__':
-    print('Building training data (2023-24 season, raw per-game stats)...')
-    df_train = build_training_rows()
-    print(f'{len(df_train)} training rows')
-
-    print('Building test data (2024-25 season, rolling averages)...')
-    df_test = build_test_rows()
-    print(f'{len(df_test)} test rows')
-
-    X_train, y_train = df_train[FEATURE_COLUMNS], df_train['Home Win']
-    X_test, y_test = df_test[FEATURE_COLUMNS], df_test['Home Win']
-
-    model = RandomForestClassifier(n_estimators=100, random_state=42)
-    model.fit(X_train, y_train)
-
-    y_pred = model.predict(X_test)
-    accuracy = accuracy_score(y_test, y_pred)
-    print(f'Test accuracy: {accuracy * 100:.2f}%  (notebook baseline: 65.47%)')
-
-    MODEL_PATH.parent.mkdir(exist_ok=True)
-    with open(MODEL_PATH, 'wb') as f:
-        pickle.dump({
-            'model': model,
-            'accuracy': accuracy,
-            'features': FEATURE_COLUMNS,
-        }, f)
-
-    print(f'Model written to {MODEL_PATH}')
+    main()

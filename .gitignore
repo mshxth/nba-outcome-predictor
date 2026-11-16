@@ -10,3 +10,4 @@ __pycache__/
 *.pyd
 results/features_cache.pkl
 __pycache__/
+results/*.pkl
