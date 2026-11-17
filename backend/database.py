@@ -57,6 +57,25 @@ def create_database():
         )
     ''')
 
+    # Player season stats table - per-game and advanced averages, refreshed periodically
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS player_season_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team TEXT NOT NULL,
+            player TEXT NOT NULL,
+            season TEXT NOT NULL,
+            ppg REAL,
+            rpg REAL,
+            apg REAL,
+            spg REAL,
+            bpg REAL,
+            vorp REAL,
+            ws REAL,
+            scraped_at TEXT NOT NULL,
+            UNIQUE(team, player, season)
+        )
+    ''')
+
     # Current injuries table - live injury report per team, refreshed by the scheduled scraper
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS current_injuries (
@@ -211,6 +230,23 @@ def player_game_stats_exist(game_id):
     result = cursor.fetchone()
     conn.close()
     return result is not None
+
+
+def upsert_player_season_stats(team, player, season, ppg, rpg, apg, spg, bpg, vorp, ws, scraped_at):
+    """Insert or update a player's season stats (keyed on team, player, season)."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        INSERT INTO player_season_stats (team, player, season, ppg, rpg, apg, spg, bpg, vorp, ws, scraped_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(team, player, season) DO UPDATE SET
+            ppg=excluded.ppg, rpg=excluded.rpg, apg=excluded.apg, spg=excluded.spg, bpg=excluded.bpg,
+            vorp=excluded.vorp, ws=excluded.ws, scraped_at=excluded.scraped_at
+    ''', (team, player, season, ppg, rpg, apg, spg, bpg, vorp, ws, scraped_at))
+
+    conn.commit()
+    conn.close()
 
 
 def get_game_injuries(game_id, team):

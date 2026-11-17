@@ -33,6 +33,7 @@ Usage:
 
 import argparse
 import copy
+import os
 import pickle
 import sqlite3
 import sys
@@ -93,6 +94,14 @@ TIE_MARGIN = 0.002  # log-loss differences below this are treated as ties
 PER_MODEL_WINDOWS = {'lr': 'all', 'lgbm': 'all', 'mlp': 'all', 'rf': 'last5'}
 PER_MODEL_CSV = RESULTS_DIR / 'per_model_final.csv'
 
+# Ablation: DROP_INJURIES=1 removes the four injury columns (same features otherwise)
+# and writes to a separate CSV so the main results are not overwritten.
+DROP_INJURIES = os.environ.get('DROP_INJURIES') == '1'
+if DROP_INJURIES:
+    FEATURE_COLUMNS = [c for c in FEATURE_COLUMNS if 'Injury' not in c]
+    FEATURES_CACHE = RESULTS_DIR / 'features_cache_no_injuries.pkl'
+    PER_MODEL_CSV = RESULTS_DIR / 'per_model_no_injuries.csv'
+
 
 # ---------------------------------------------------------------- features
 
@@ -120,8 +129,6 @@ def build_season(season, games):
             home_efg, away_efg = get_input_format(date, home, away, get_avg_efgs)
             home_tov, away_tov = get_input_format(date, home, away, get_avg_tovs)
             home_orb, away_orb = get_input_format(date, home, away, get_avg_orbs)
-            home_inj = database.get_game_injuries(game_id, home)
-            away_inj = database.get_game_injuries(game_id, away)
             home_b2b, away_b2b = scrape_back_to_back(date, home, away)
             row = {
                 'season': season, 'game_id': game_id, 'date': date,
@@ -129,13 +136,18 @@ def build_season(season, games):
                 'Home eFG%': home_efg, 'Away eFG%': away_efg,
                 'Home TOV%': home_tov, 'Away TOV%': away_tov,
                 'Home ORB%': home_orb, 'Away ORB%': away_orb,
-                'Home Injury Value': get_injury_value(home_inj, home, date),
-                'Away Injury Value': get_injury_value(away_inj, away, date),
-                'Home Injury Advanced': get_injury_advanced(home_inj, home, date),
-                'Away Injury Advanced': get_injury_advanced(away_inj, away, date),
                 'Home B2B': home_b2b, 'Away B2B': away_b2b,
                 'Home Win': home_win,
             }
+            if not DROP_INJURIES:
+                home_inj = database.get_game_injuries(game_id, home)
+                away_inj = database.get_game_injuries(game_id, away)
+                row.update({
+                    'Home Injury Value': get_injury_value(home_inj, home, date),
+                    'Away Injury Value': get_injury_value(away_inj, away, date),
+                    'Home Injury Advanced': get_injury_advanced(home_inj, home, date),
+                    'Away Injury Advanced': get_injury_advanced(away_inj, away, date),
+                })
         except Exception:
             dropped += 1
             continue
@@ -146,15 +158,22 @@ def build_season(season, games):
                         'dropped': dropped, 'zero_filled': zero_filled}
 
 
-def load_features(workers):
+def _db_signature():
+    st = os.stat(database.DB_PATH)
+    return (database.DB_PATH, st.st_size, int(st.st_mtime))
+
+
+def load_features(workers, last_season=LAST_SEASON):
+    """Feature rows for every season from FIRST_SEASON through last_season (cached per DB file)."""
+    sig = _db_signature()
     if FEATURES_CACHE.exists():
         with open(FEATURES_CACHE, 'rb') as f:
             cached = pickle.load(f)
-        if cached['db_path'] == database.DB_PATH:
+        if cached.get('sig') == sig and cached.get('last_season') == last_season:
             print(f'Loaded cached features from {FEATURES_CACHE}')
             return cached['df'], cached['drops']
     seasons = games_by_season()
-    wanted = [s for s in sorted(seasons) if FIRST_SEASON <= s <= LAST_SEASON]
+    wanted = [s for s in sorted(seasons) if FIRST_SEASON <= s <= last_season]
     print(f'Building features for {len(wanted)} seasons ({wanted[0]}..{wanted[-1]}) with {workers} workers...')
     t0 = time.time()
     results = Parallel(n_jobs=workers)(delayed(build_season)(s, seasons[s]) for s in wanted)
@@ -163,7 +182,7 @@ def load_features(workers):
     print(f'Built {len(df)} rows in {(time.time() - t0) / 60:.1f} min')
     print(drops.to_string(index=False))
     with open(FEATURES_CACHE, 'wb') as f:
-        pickle.dump({'db_path': database.DB_PATH, 'df': df, 'drops': drops}, f)
+        pickle.dump({'sig': sig, 'last_season': last_season, 'df': df, 'drops': drops}, f)
     return df, drops
 
 
@@ -655,6 +674,9 @@ if __name__ == '__main__':
     df, drops = load_features(args.workers)
     if args.per_model:
         run_per_model(df, args.workers)
+        if DROP_INJURIES:
+            print(f'Ablation (no injury features): {FEATURE_COLUMNS}')
+            sys.exit(0)  # don't overwrite SUMMARY.md with the ablation
         summarize()
         sys.exit(0)
     drops.to_csv(DROPS_CSV, index=False)

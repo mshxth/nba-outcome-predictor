@@ -9,7 +9,7 @@ from pathlib import Path
 from config import TEAM_TO_ABBR
 from data import (
     get_input_format, get_avg_rtgs, get_avg_efgs, get_avg_tovs, get_avg_orbs,
-    get_current_team_injuries, get_injury_value, get_injury_advanced
+    get_current_team_injuries, scrape_back_to_back
 )
 
 # Paths - use local files
@@ -93,33 +93,26 @@ def predict_game_outcome(home_team, away_team, model_data, date=None):
     # Get cached team stats
     stats = get_cached_team_stats(prediction_date, home_team, away_team)
     
-    # Get current injuries (from the DB, refreshed by pipeline/scrape_teams.py)
-    home_injuries = get_current_team_injuries(home_team)
-    away_injuries = get_current_team_injuries(away_team)
+    # Back-to-back flags come from the schedule (games played the day before `prediction_date`)
+    home_b2b, away_b2b = scrape_back_to_back(prediction_date, home_team, away_team)
 
-    home_injury_value = get_injury_value(home_injuries, home_team)
-    away_injury_value = get_injury_value(away_injuries, away_team)
-
-    home_injury_advanced = get_injury_advanced(home_injuries, home_team)
-    away_injury_advanced = get_injury_advanced(away_injuries, away_team)
-
-    # Build input
-    import pandas as pd
-    input_data = { 
-        "Home ORtg": [stats['home_rtg']], 
-        "Away ORtg": [stats['away_rtg']], 
-        "Home eFG%": [stats['home_efg']], 
-        "Away eFG%": [stats['away_efg']], 
-        "Home TOV%": [stats['home_tov']], 
-        "Away TOV%": [stats['away_tov']], 
-        "Home ORB%": [stats['home_orb']], 
-        "Away ORB%": [stats['away_orb']], 
-        "Home Injury Value": [home_injury_value], 
-        "Away Injury Value": [away_injury_value],
-        "Home Injury Advanced": [home_injury_advanced], 
-        "Away Injury Advanced": [away_injury_advanced]
+    # Build input in the exact column order the model was trained on. Every feature is
+    # computed only from games before prediction_date, matching training.
+    available = {
+        "Home ORtg": stats['home_rtg'], "Away ORtg": stats['away_rtg'],
+        "Home eFG%": stats['home_efg'], "Away eFG%": stats['away_efg'],
+        "Home TOV%": stats['home_tov'], "Away TOV%": stats['away_tov'],
+        "Home ORB%": stats['home_orb'], "Away ORB%": stats['away_orb'],
+        "Home B2B": home_b2b, "Away B2B": away_b2b,
     }
-    
+    features = model_data['features']
+    unsupported = [f for f in features if f not in available]
+    if unsupported:
+        raise ValueError(f"Model needs features the backend cannot compute: {unsupported}. "
+                         f"Retrain with pipeline/train_model.py.")
+    import pandas as pd
+    input_data = {f: [available[f]] for f in features}
+
     # Predict
     prediction_df = pd.DataFrame(input_data)
     prediction = rf_model.predict(prediction_df)
@@ -166,8 +159,7 @@ def get_team_comparison_stats(home_team, away_team, date=None):
     home_injuries = get_current_team_injuries(home_team)
     away_injuries = get_current_team_injuries(away_team)
 
-    home_injury_value = get_injury_value(home_injuries, home_team)
-    away_injury_value = get_injury_value(away_injuries, away_team)
+    home_b2b, away_b2b = scrape_back_to_back(prediction_date, home_team, away_team)
 
     # Determine advantages
     def get_advantage(home_val, away_val, lower_is_better=False):
@@ -209,13 +201,13 @@ def get_team_comparison_stats(home_team, away_team, date=None):
                 "metric": "Injury Impact",
                 "home": "High" if len(home_injuries or []) > 2 else "Medium" if len(home_injuries or []) > 0 else "Low",
                 "away": "High" if len(away_injuries or []) > 2 else "Medium" if len(away_injuries or []) > 0 else "Low",
-                "advantage": get_advantage(home_injury_value, away_injury_value)
+                "advantage": get_advantage(len(away_injuries or []), len(home_injuries or []))
             },
             {
                 "metric": "Back-to-Back",
-                "home": "No",
-                "away": "No",
-                "advantage": "even"
+                "home": "Yes" if home_b2b else "No",
+                "away": "Yes" if away_b2b else "No",
+                "advantage": "even" if home_b2b == away_b2b else ("away" if home_b2b else "home")
             }
         ],
         "breakdown": {

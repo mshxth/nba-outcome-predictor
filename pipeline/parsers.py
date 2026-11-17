@@ -150,6 +150,59 @@ def parse_player_game_stats(html, home_abbr, away_abbr):
     return result
 
 
+def parse_team_per_game_stats(html):
+    """Parse a team page's per-game stats table.
+
+    Returns {player_name: {'ppg':.., 'rpg':.., 'apg':.., 'spg':.., 'bpg':..}}.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    players = soup.find('table', id='per_game_stats').find('tbody').find_all('tr')
+
+    stats = {}
+    for player in players:
+        name_cell = player.find('td', attrs={'data-stat': 'name_display'})
+        if not name_cell or not name_cell.find('a'):
+            continue
+        name = name_cell.find('a').get_text()
+        stats[name] = {
+            'ppg': float(player.find('td', attrs={'data-stat': 'pts_per_g'}).get_text()),
+            'rpg': float(player.find('td', attrs={'data-stat': 'trb_per_g'}).get_text()),
+            'apg': float(player.find('td', attrs={'data-stat': 'ast_per_g'}).get_text()),
+            'spg': float(player.find('td', attrs={'data-stat': 'stl_per_g'}).get_text()),
+            'bpg': float(player.find('td', attrs={'data-stat': 'blk_per_g'}).get_text()),
+        }
+
+    return stats
+
+
+def parse_team_advanced_stats(html):
+    """Parse a team page's advanced stats table (VORP, WS), hidden in an HTML comment.
+
+    Returns {player_name: {'vorp':.., 'ws':..}}.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    comments = soup.find_all(string=lambda text: isinstance(text, Comment))
+
+    for comment in comments:
+        comment_soup = BeautifulSoup(comment, 'html.parser')
+        advanced = comment_soup.find('table', id='advanced')
+        if advanced:
+            rows = advanced.find('tbody').find_all('tr')
+            stats = {}
+            for player in rows:
+                name_cell = player.find('td', attrs={'data-stat': 'name_display'})
+                if not name_cell or not name_cell.find('a'):
+                    continue
+                name = name_cell.find('a').get_text()
+                stats[name] = {
+                    'vorp': float(player.find('td', attrs={'data-stat': 'vorp'}).get_text()),
+                    'ws': float(player.find('td', attrs={'data-stat': 'ws'}).get_text()),
+                }
+            return stats
+
+    return {}
+
+
 def parse_team_injuries(html):
     """Parse a team page's current injury report, hidden in an HTML comment.
 
