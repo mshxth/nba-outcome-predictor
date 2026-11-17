@@ -49,6 +49,11 @@ TEAM_TO_ABBR = {
     "Vancouver": "VAN",     # -> Memphis Grizzlies, 2001-02
 }
 
+# The 30 teams that exist today (everything except the historical-only names above).
+# Live code (API validation, live scrapers) must use this, not TEAM_TO_ABBR.
+HISTORICAL_TEAMS = {"Seattle", "New Jersey", "New Orleans/Oklahoma City", "Vancouver"}
+CURRENT_TEAMS = [team for team in TEAM_TO_ABBR if team not in HISTORICAL_TEAMS]
+
 
 # URLs
 BOX_SCORES = "https://www.basketball-reference.com/boxscores/"

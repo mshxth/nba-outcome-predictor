@@ -6,7 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 
 # Import from current directory (backend folder)
-from config import TEAM_TO_ABBR
+from config import TEAM_TO_ABBR, CURRENT_TEAMS
 from data import (
     get_input_format, get_avg_rtgs, get_avg_efgs, get_avg_tovs, get_avg_orbs,
     get_current_team_injuries, scrape_back_to_back, get_injury_value, get_injury_advanced
@@ -84,9 +84,9 @@ def predict_game_outcome(home_team, away_team, model_data, date=None):
         (winner, confidence) tuple
     """
     # Validate teams
-    if home_team not in TEAM_TO_ABBR:
+    if home_team not in CURRENT_TEAMS:
         raise ValueError(f"Invalid home team: {home_team}. Must be a valid NBA city name.")
-    if away_team not in TEAM_TO_ABBR:
+    if away_team not in CURRENT_TEAMS:
         raise ValueError(f"Invalid away team: {away_team}. Must be a valid NBA city name.")
     
     # Use provided date or default
@@ -159,9 +159,9 @@ def get_team_comparison_stats(home_team, away_team, date=None):
     from datetime import datetime
     
     # Validate teams
-    if home_team not in TEAM_TO_ABBR:
+    if home_team not in CURRENT_TEAMS:
         raise ValueError(f"Invalid home team: {home_team}")
-    if away_team not in TEAM_TO_ABBR:
+    if away_team not in CURRENT_TEAMS:
         raise ValueError(f"Invalid away team: {away_team}")
     
     # Use provided date or default

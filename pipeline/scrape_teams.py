@@ -18,7 +18,7 @@ sys.path.insert(0, str(REPO_ROOT / 'backend'))
 sys.path.insert(0, str(REPO_ROOT / 'pipeline'))
 
 import database
-from config import TEAM_TO_ABBR, TEAMS
+from config import TEAM_TO_ABBR, CURRENT_TEAMS, TEAMS
 from parsers import parse_team_per_game_stats, parse_team_advanced_stats, parse_team_injuries
 from utils import fetch_html
 
@@ -66,7 +66,7 @@ if __name__ == '__main__':
     database.create_database()
     season = current_season_label()
 
-    for team in TEAM_TO_ABBR:
+    for team in CURRENT_TEAMS:
         players, injuries = scrape_team(team, season)
         print(f'{team}: {players} players, {injuries} current injuries')
 
