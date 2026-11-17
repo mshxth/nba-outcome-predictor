@@ -362,6 +362,26 @@ def get_team_player_stats_for_season(team, season_start_date, before_date):
     return results
 
 
+def get_recent_team_games(team, before_date, n):
+    """The team's last n games strictly before before_date, newest first.
+
+    Each row is (off_rtg, opp_off_rtg, efg_pct, opp_efg_pct, tov_pct, opp_tov_pct, orb_pct, opp_orb_pct).
+    Games carry over across seasons, so early in a season this reaches into the previous one.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute('''
+        SELECT ts.off_rtg, ts.opp_off_rtg, ts.efg_pct, ts.opp_efg_pct,
+               ts.tov_pct, ts.opp_tov_pct, ts.orb_pct, ts.opp_orb_pct
+        FROM team_stats ts
+        JOIN games g ON ts.game_id = g.id
+        WHERE ts.team = ? AND g.date < ?
+        ORDER BY g.date DESC, g.id DESC
+        LIMIT ?
+    ''', (team, before_date, n)).fetchall()
+    conn.close()
+    return rows
+
+
 def get_home_win(date, home, away):
     """Get if home team won."""
     conn = sqlite3.connect(DB_PATH)

@@ -8,7 +8,7 @@ from pathlib import Path
 # Import from current directory (backend folder)
 from config import TEAM_TO_ABBR, CURRENT_TEAMS
 from data import (
-    get_input_format, get_avg_rtgs, get_avg_efgs, get_avg_tovs, get_avg_orbs,
+    get_game_window_features,
     get_current_team_injuries, scrape_back_to_back, get_injury_value, get_injury_advanced
 )
 from database import get_game_id, get_game_injuries
@@ -52,21 +52,13 @@ def _injured_players(date, home_team, away_team):
 
 @lru_cache(maxsize=128)
 def get_cached_team_stats(date, home_team, away_team):
-    """Cache team stats for prediction."""
-    home_rtg, away_rtg = get_input_format(date, home_team, away_team, get_avg_rtgs)
-    home_efg, away_efg = get_input_format(date, home_team, away_team, get_avg_efgs)
-    home_tov, away_tov = get_input_format(date, home_team, away_team, get_avg_tovs)
-    home_orb, away_orb = get_input_format(date, home_team, away_team, get_avg_orbs)
-    
+    """Cache rolling team stats (last 10/30/90 games before `date`) for prediction."""
+    f = get_game_window_features(date, home_team, away_team)
     return {
-        'home_rtg': home_rtg,
-        'away_rtg': away_rtg,
-        'home_efg': home_efg,
-        'away_efg': away_efg,
-        'home_tov': home_tov,
-        'away_tov': away_tov,
-        'home_orb': home_orb,
-        'away_orb': away_orb
+        'home_rtg': f['Home ORtg'], 'away_rtg': f['Away ORtg'],
+        'home_efg': f['Home eFG%'], 'away_efg': f['Away eFG%'],
+        'home_tov': f['Home TOV%'], 'away_tov': f['Away TOV%'],
+        'home_orb': f['Home ORB%'], 'away_orb': f['Away ORB%'],
     }
 
 

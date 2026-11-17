@@ -52,13 +52,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import database
 from data import (
-    get_avg_rtgs, get_avg_efgs, get_avg_tovs, get_avg_orbs, get_input_format,
+    get_game_window_features, GAME_WINDOWS, NotEnoughHistory,
     get_injury_value, get_injury_advanced, scrape_back_to_back,
 )
 from utils import season_label_for_date
 
 RESULTS_DIR = REPO_ROOT / 'results'
 FEATURES_CACHE = RESULTS_DIR / 'features_cache.pkl'
+# Bump whenever build_season's output changes, so a stale cache can never be reused.
+FEATURE_VERSION = 'game-windows-v2'
 FOLDS_CSV = RESULTS_DIR / 'folds.csv'
 CALIBRATION_CSV = RESULTS_DIR / 'calibration.csv'
 DROPS_CSV = RESULTS_DIR / 'feature_drops.csv'
@@ -122,20 +124,14 @@ def build_season(season, games):
     want to count). Rows where a team had no games at all in the lookback
     (the data layer then silently returns 0) are counted as zero_filled.
     """
-    rows, dropped = [], 0
+    rows, dropped, short_history = [], 0, 0
     for game_id, date, home, away, home_win in games:
         try:
-            home_rtg, away_rtg = get_input_format(date, home, away, get_avg_rtgs)
-            home_efg, away_efg = get_input_format(date, home, away, get_avg_efgs)
-            home_tov, away_tov = get_input_format(date, home, away, get_avg_tovs)
-            home_orb, away_orb = get_input_format(date, home, away, get_avg_orbs)
+            factors = get_game_window_features(date, home, away)
             home_b2b, away_b2b = scrape_back_to_back(date, home, away)
             row = {
                 'season': season, 'game_id': game_id, 'date': date,
-                'Home ORtg': home_rtg, 'Away ORtg': away_rtg,
-                'Home eFG%': home_efg, 'Away eFG%': away_efg,
-                'Home TOV%': home_tov, 'Away TOV%': away_tov,
-                'Home ORB%': home_orb, 'Away ORB%': away_orb,
+                **factors,
                 'Home B2B': home_b2b, 'Away B2B': away_b2b,
                 'Home Win': home_win,
             }
@@ -148,14 +144,17 @@ def build_season(season, games):
                     'Home Injury Advanced': get_injury_advanced(home_inj, home, date),
                     'Away Injury Advanced': get_injury_advanced(away_inj, away, date),
                 })
+        except NotEnoughHistory:
+            short_history += 1  # expected: a team's first few games in the data have nothing to average
+            continue
         except Exception:
-            dropped += 1
+            dropped += 1  # unexpected: the caller should treat a high count as a data problem
             continue
         rows.append(row)
     df = pd.DataFrame(rows)
-    zero_filled = int(((df['Home ORtg'] == 0) | (df['Away ORtg'] == 0)).sum()) if len(df) else 0
+    zero_filled = 0  # kept for the drops table; games without enough history are dropped, never zero-filled
     return season, df, {'season': season, 'games': len(games), 'rows': len(df),
-                        'dropped': dropped, 'zero_filled': zero_filled}
+                        'dropped': dropped, 'short_history': short_history, 'zero_filled': zero_filled}
 
 
 def _db_signature():
@@ -169,7 +168,7 @@ def load_features(workers, last_season=LAST_SEASON):
     if FEATURES_CACHE.exists():
         with open(FEATURES_CACHE, 'rb') as f:
             cached = pickle.load(f)
-        if cached.get('sig') == sig and cached.get('last_season') == last_season:
+        if cached.get('sig') == sig and cached.get('last_season') == last_season and cached.get('windows') == GAME_WINDOWS and cached.get('version') == FEATURE_VERSION:
             print(f'Loaded cached features from {FEATURES_CACHE}')
             return cached['df'], cached['drops']
     seasons = games_by_season()
@@ -182,7 +181,7 @@ def load_features(workers, last_season=LAST_SEASON):
     print(f'Built {len(df)} rows in {(time.time() - t0) / 60:.1f} min')
     print(drops.to_string(index=False))
     with open(FEATURES_CACHE, 'wb') as f:
-        pickle.dump({'sig': sig, 'last_season': last_season, 'df': df, 'drops': drops}, f)
+        pickle.dump({'sig': sig, 'last_season': last_season, 'windows': GAME_WINDOWS, 'version': FEATURE_VERSION, 'df': df, 'drops': drops}, f)
     return df, drops
 
 

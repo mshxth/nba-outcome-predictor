@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 from config import get_last_n_days_from_date, get_season_start_date
 from database import (
-    get_team_stats_for_dates, get_home_win, check_back_to_back,
+    get_team_stats_for_dates, get_home_win, check_back_to_back, get_recent_team_games,
     get_team_player_stats_for_dates, get_team_player_stats_for_season,
     get_current_injuries, get_game_injuries,
 )
@@ -111,6 +111,55 @@ def get_input_format(date, home, away, func, windows=(7, 30)):
         away_vals.append((away_avgs[0] + home_avgs[1]) / 2)
 
     return sum(home_vals) / len(home_vals), sum(away_vals) / len(away_vals)
+
+
+# ===== GAME-COUNT ROLLING FEATURES (the deployed four-factor features) =====
+
+# Rolling windows measured in GAMES, not days: every window always covers the same number of
+# games, so the features are equally reliable for every team and date. A 7-day window holds
+# anywhere from 1 to 4 games (and the old code padded short windows with games from 5-9 weeks
+# earlier). (10, 30, 90) won the walk-forward comparison -- see results/game_windows_nested*.csv.
+GAME_WINDOWS = (10, 30, 90)
+MIN_PRIOR_GAMES = 10   # fewer prior games than this -> no feature (a new team, or the start of the data)
+FACTOR_NAMES = ('ORtg', 'eFG%', 'TOV%', 'ORB%')  # order of the columns get_recent_team_games returns, in pairs
+
+
+class NotEnoughHistory(ValueError):
+    """A team has fewer than MIN_PRIOR_GAMES games before the requested date."""
+
+
+def get_game_window_features(date, home, away, windows=GAME_WINDOWS, min_games=MIN_PRIOR_GAMES):
+    """Rolling four-factor features for a game, from games strictly before `date` only.
+
+    For each window of n games, the home value blends the home team's own average with the away
+    team's "allowed" average, (home own + away allowed) / 2, and the final feature averages that
+    across windows. A window uses min(n, games available) games. Raises ValueError if either team
+    has fewer than min_games prior games.
+
+    Returns {'Home ORtg': .., 'Away ORtg': .., 'Home eFG%': .., ...} (8 values).
+    """
+    n_max = max(windows)
+    games = {}
+    for side, team in (('Home', home), ('Away', away)):
+        rows = get_recent_team_games(team, date, n_max)
+        if len(rows) < min_games:
+            raise NotEnoughHistory(f"Not enough games before {date} for {team} ({len(rows)} < {min_games}).")
+        games[side] = rows
+
+    def avg(rows, col, n):
+        vals = [r[col] for r in rows[:n] if r[col] is not None]
+        return sum(vals) / len(vals)
+
+    out = {}
+    for k, name in enumerate(FACTOR_NAMES):
+        own, allowed = 2 * k, 2 * k + 1  # column positions: team's stat, opponent's stat in that game
+        home_vals, away_vals = [], []
+        for n in windows:
+            home_vals.append((avg(games['Home'], own, n) + avg(games['Away'], allowed, n)) / 2)
+            away_vals.append((avg(games['Away'], own, n) + avg(games['Home'], allowed, n)) / 2)
+        out[f'Home {name}'] = sum(home_vals) / len(home_vals)
+        out[f'Away {name}'] = sum(away_vals) / len(away_vals)
+    return out
 
 
 # ===== INJURY/PLAYER-VALUE FUNCTIONS (DB-backed, replaces HTML parsing at request time) =====

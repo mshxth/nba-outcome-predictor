@@ -80,7 +80,7 @@ def main():
     df, drops = mc.load_features(args.workers, last_season=latest)
     if drops['dropped'].sum() > 0.02 * (drops['games'].sum()):
         raise SystemExit(f"{int(drops['dropped'].sum())} of {int(drops['games'].sum())} games could not be "
-                         f"featurized (missing player stats?). Refusing to train.\n{drops.to_string(index=False)}")
+                         f"featurized (missing data?). Refusing to train.\n{drops.to_string(index=False)}")
 
     # Held-out check: the last season that is complete (everything before the latest, partial one).
     seasons = sorted(df['season'].unique())
