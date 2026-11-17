@@ -9,8 +9,9 @@ from pathlib import Path
 from config import TEAM_TO_ABBR
 from data import (
     get_input_format, get_avg_rtgs, get_avg_efgs, get_avg_tovs, get_avg_orbs,
-    get_current_team_injuries, scrape_back_to_back
+    get_current_team_injuries, scrape_back_to_back, get_injury_value, get_injury_advanced
 )
+from database import get_game_id, get_game_injuries
 
 # Paths - use local files
 MODEL_PATH = str(Path(__file__).resolve().parent / 'models' / 'trained_model.pkl')
@@ -36,6 +37,17 @@ def load_model():
         raise Exception(f"Model file not found at {MODEL_PATH}")
     except Exception as e:
         raise Exception(f"Failed to load model: {e}")
+
+
+def _injured_players(date, home_team, away_team):
+    """Players out for each team: the game's recorded inactive list for a past game, otherwise
+    the current injury report (a future game's inactives are not known until the box score)."""
+    from datetime import date as _date
+    if date < _date.today().isoformat():
+        game_id = get_game_id(date, home_team, away_team)
+        if game_id is not None:
+            return get_game_injuries(game_id, home_team), get_game_injuries(game_id, away_team)
+    return get_current_team_injuries(home_team), get_current_team_injuries(away_team)
 
 
 @lru_cache(maxsize=128)
@@ -98,6 +110,7 @@ def predict_game_outcome(home_team, away_team, model_data, date=None):
 
     # Build input in the exact column order the model was trained on. Every feature is
     # computed only from games before prediction_date, matching training.
+    home_injured, away_injured = _injured_players(prediction_date, home_team, away_team)
     available = {
         "Home ORtg": stats['home_rtg'], "Away ORtg": stats['away_rtg'],
         "Home eFG%": stats['home_efg'], "Away eFG%": stats['away_efg'],
@@ -105,6 +118,13 @@ def predict_game_outcome(home_team, away_team, model_data, date=None):
         "Home ORB%": stats['home_orb'], "Away ORB%": stats['away_orb'],
         "Home B2B": home_b2b, "Away B2B": away_b2b,
     }
+    if any('Injury' in f for f in model_data['features']):
+        available.update({
+            "Home Injury Value": get_injury_value(home_injured, home_team, prediction_date),
+            "Away Injury Value": get_injury_value(away_injured, away_team, prediction_date),
+            "Home Injury Advanced": get_injury_advanced(home_injured, home_team, prediction_date),
+            "Away Injury Advanced": get_injury_advanced(away_injured, away_team, prediction_date),
+        })
     features = model_data['features']
     unsupported = [f for f in features if f not in available]
     if unsupported:

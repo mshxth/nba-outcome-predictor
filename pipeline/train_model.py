@@ -1,15 +1,16 @@
 """Train the deployed game-outcome model from SQLite, with no leakage.
 
 Every feature is built by model_comparison.build_season using only games played
-BEFORE the game date (rolling 7/30-day four factors blended with the opponent's
-allowed stats, plus back-to-back flags). Nothing from the game being predicted
--- its own box score, final stats or inactive list -- is used as an input.
+BEFORE the game date. Nothing from the game being predicted -- its own box score,
+final stats -- is used as an input. Features (14):
+  - four factors (ORtg, eFG%, TOV%, ORB%) x home/away: rolling 7/30-day team average
+    blended with the opponent's allowed average
+  - Injury Value / Injury Advanced x home/away: the team's rolling pre-game player value
+    (from player_game_stats) minus the value of the players on that game's inactive list
+  - back-to-back x home/away
 
-Default features (10): the four factors x home/away, and back-to-back x home/away.
-The per-game injury features need the player_game_stats table, which only exists in
-the large research database, so they are off by default. Pass --with-injuries to use
-them when pointing NBA_DB_PATH at a database that has that table (research only: the
-live backend cannot serve those features).
+Pass --no-injuries for the 10-feature version (works on a database with no
+player_game_stats table).
 
 Two steps:
   1. Fit on every season before the last complete one, score on that season
@@ -30,12 +31,13 @@ import sys
 from pathlib import Path
 
 # Must be decided before model_comparison is imported (it picks the feature list at import).
-if '--with-injuries' not in sys.argv:
+if '--no-injuries' in sys.argv:
     os.environ['DROP_INJURIES'] = '1'
 
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / 'backend'))
@@ -52,7 +54,8 @@ SEED = mc.SEED
 def make_model(kind):
     if kind == 'rf':
         return RandomForestClassifier(n_estimators=100, random_state=SEED, n_jobs=-1)
-    return make_pipeline(LogisticRegression(max_iter=1000))
+    # Standardized: the injury features are in the hundreds while the four factors are ~0.5-120.
+    return make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000))
 
 
 def latest_season_in_db():
@@ -68,13 +71,16 @@ def main():
     parser.add_argument('--model', choices=['lr', 'rf'], default='lr')
     parser.add_argument('--out', type=Path, default=MODEL_PATH)
     parser.add_argument('--workers', type=int, default=4)
-    parser.add_argument('--with-injuries', action='store_true')
+    parser.add_argument('--no-injuries', action='store_true')
     args = parser.parse_args()
 
     cols = mc.FEATURE_COLUMNS
     latest = latest_season_in_db()
     print(f'DB: {database.DB_PATH}\nFeatures ({len(cols)}): {cols}\nLatest season in DB: {latest}')
-    df, _ = mc.load_features(args.workers, last_season=latest)
+    df, drops = mc.load_features(args.workers, last_season=latest)
+    if drops['dropped'].sum() > 0.02 * (drops['games'].sum()):
+        raise SystemExit(f"{int(drops['dropped'].sum())} of {int(drops['games'].sum())} games could not be "
+                         f"featurized (missing player stats?). Refusing to train.\n{drops.to_string(index=False)}")
 
     # Held-out check: the last season that is complete (everything before the latest, partial one).
     seasons = sorted(df['season'].unique())

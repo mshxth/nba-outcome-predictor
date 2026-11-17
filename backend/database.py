@@ -86,26 +86,18 @@ def create_database():
         )
     ''')
 
-    # Player game stats table - full per-player basic + advanced box score line for
-    # every player who recorded minutes in a game (not just season aggregates)
+    # Player game stats table - the per-player box score columns the injury features use
+    # (minutes, pts, trb, ast, stl, blk, bpm). Kept slim on purpose: the database is committed
+    # to git, so every extra column is repo bloat. The UNIQUE constraint's index also serves
+    # lookups by game_id. (The large research database has a wider table of the same name;
+    # everything here works on both.)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS player_game_stats (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             game_id INTEGER NOT NULL,
             team TEXT NOT NULL,
             player TEXT NOT NULL,
-            minutes REAL,
-            fg REAL, fga REAL, fg_pct REAL,
-            fg3 REAL, fg3a REAL, fg3_pct REAL,
-            ft REAL, fta REAL, ft_pct REAL,
-            orb REAL, drb REAL, trb REAL,
-            ast REAL, stl REAL, blk REAL, tov REAL, pf REAL, pts REAL,
-            game_score REAL, plus_minus REAL,
-            ts_pct REAL, efg_pct REAL,
-            fg3a_per_fga_pct REAL, fta_per_fga_pct REAL,
-            orb_pct REAL, drb_pct REAL, trb_pct REAL,
-            ast_pct REAL, stl_pct REAL, blk_pct REAL, tov_pct REAL,
-            usg_pct REAL, off_rtg REAL, def_rtg REAL, bpm REAL,
+            minutes REAL, pts REAL, trb REAL, ast REAL, stl REAL, blk REAL, bpm REAL,
             FOREIGN KEY (game_id) REFERENCES games(id),
             UNIQUE(game_id, team, player)
         )
@@ -114,7 +106,6 @@ def create_database():
     # Create indexes for faster queries
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_games_date ON games(date)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_games_teams ON games(home_team, away_team)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_game_stats_game ON player_game_stats(game_id)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_team_stats_team ON team_stats(team)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_team_stats_game ON team_stats(game_id)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_game_injuries_team ON game_injuries(team)')
@@ -195,30 +186,31 @@ def insert_game_injuries(game_id, team, players):
     conn.close()
 
 
-def insert_player_game_stats(game_id, team, player, stats):
-    """Insert a player's per-game box score line (idempotent via UNIQUE constraint).
+PLAYER_GAME_COLUMNS = ['minutes', 'pts', 'trb', 'ast', 'stl', 'blk', 'bpm']
 
-    `stats` is a dict keyed by the same column names as the `player_game_stats`
-    table (minutes, fg, fga, ..., off_rtg, def_rtg, bpm) -- see
-    pipeline/parsers.py:parse_player_game_stats.
+
+def insert_player_game_stats(game_id, team, player, stats):
+    """Insert a player's per-game line (idempotent via the UNIQUE constraint).
+
+    `stats` is a dict as returned by pipeline/parsers.py:parse_player_game_stats; only the
+    PLAYER_GAME_COLUMNS are stored.
     """
     conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    columns = [
-        'minutes', 'fg', 'fga', 'fg_pct', 'fg3', 'fg3a', 'fg3_pct', 'ft', 'fta', 'ft_pct',
-        'orb', 'drb', 'trb', 'ast', 'stl', 'blk', 'tov', 'pf', 'pts', 'game_score', 'plus_minus',
-        'ts_pct', 'efg_pct', 'fg3a_per_fga_pct', 'fta_per_fga_pct', 'orb_pct', 'drb_pct', 'trb_pct',
-        'ast_pct', 'stl_pct', 'blk_pct', 'tov_pct', 'usg_pct', 'off_rtg', 'def_rtg', 'bpm',
-    ]
-    placeholders = ', '.join('?' * (len(columns) + 3))
-    cursor.execute(f'''
-        INSERT OR IGNORE INTO player_game_stats (game_id, team, player, {', '.join(columns)})
-        VALUES ({placeholders})
-    ''', (game_id, team, player, *[stats.get(c) for c in columns]))
-
+    conn.execute(f'''
+        INSERT OR IGNORE INTO player_game_stats (game_id, team, player, {', '.join(PLAYER_GAME_COLUMNS)})
+        VALUES ({', '.join('?' * (len(PLAYER_GAME_COLUMNS) + 3))})
+    ''', (game_id, team, player, *[stats.get(c) for c in PLAYER_GAME_COLUMNS]))
     conn.commit()
     conn.close()
+
+
+def get_game_id(date, home, away):
+    """Row id of a stored game, or None."""
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute('SELECT id FROM games WHERE date = ? AND home_team = ? AND away_team = ?',
+                       (date, home, away)).fetchone()
+    conn.close()
+    return row[0] if row else None
 
 
 def player_game_stats_exist(game_id):

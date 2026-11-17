@@ -22,7 +22,7 @@ sys.path.insert(0, str(REPO_ROOT / 'pipeline'))
 
 import database
 from config import TEAM_TO_ABBR, BOX_SCORES, SCORES_BY_DATE
-from parsers import parse_four_factors, parse_final_score, parse_inactive_players
+from parsers import parse_four_factors, parse_final_score, parse_inactive_players, parse_player_game_stats
 from utils import fetch_html
 
 ABBR_TO_TEAM = {abbr: team for team, abbr in TEAM_TO_ABBR.items()}
@@ -88,6 +88,13 @@ def scrape_date(date):
             database.insert_game_injuries(game_id, home_team, inactives[home_abbr])
         if away_abbr in inactives:
             database.insert_game_injuries(game_id, away_team, inactives[away_abbr])
+
+        # Per-player box score lines (same page, no extra request) -- the injury features
+        # are each team's rolling player value, so every new game must store them.
+        players = parse_player_game_stats(box_html, home_abbr, away_abbr)
+        for side, team in (('home', home_team), ('away', away_team)):
+            for row in players.get(side, []):
+                database.insert_player_game_stats(game_id, team, row['player'], row)
 
         inserted += 1
 
