@@ -36,7 +36,7 @@ def date_range(start, end):
         d += timedelta(days=1)
 
 
-def scrape_date(date):
+def scrape_date(date, store_player_stats=False):
     """Scrape one date's scoreboard and insert any games not already stored.
 
     Returns (inserted_count, games_found_count).
@@ -89,12 +89,14 @@ def scrape_date(date):
         if away_abbr in inactives:
             database.insert_game_injuries(game_id, away_team, inactives[away_abbr])
 
-        # Per-player box score lines (same page, no extra request) -- the injury features
-        # are each team's rolling player value, so every new game must store them.
-        players = parse_player_game_stats(box_html, home_abbr, away_abbr)
-        for side, team in (('home', home_team), ('away', away_team)):
-            for row in players.get(side, []):
-                database.insert_player_game_stats(game_id, team, row['player'], row)
+        # Per-player box score lines (same page, no extra request). Off by default: the deployed
+        # model does not use injury features, and these rows would add ~7 MB to the committed DB.
+        # Needed only for --with-injuries training (research); then run with --player-stats always.
+        if store_player_stats:
+            players = parse_player_game_stats(box_html, home_abbr, away_abbr)
+            for side, team in (('home', home_team), ('away', away_team)):
+                for row in players.get(side, []):
+                    database.insert_player_game_stats(game_id, team, row['player'], row)
 
         inserted += 1
 
@@ -106,13 +108,14 @@ if __name__ == '__main__':
     yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
     arg_parser.add_argument('--start', default=yesterday)
     arg_parser.add_argument('--end', default=yesterday)
+    arg_parser.add_argument('--player-stats', action='store_true', help='also store per-player box score lines')
     args = arg_parser.parse_args()
 
     database.create_database()
 
     total_inserted, total_found = 0, 0
     for date in date_range(args.start, args.end):
-        inserted, found = scrape_date(date)
+        inserted, found = scrape_date(date, args.player_stats)
         total_inserted += inserted
         total_found += found
         print(f'{date}: {inserted} new games inserted (of {found} found)')

@@ -2,15 +2,15 @@
 
 Every feature is built by model_comparison.build_season using only games played
 BEFORE the game date. Nothing from the game being predicted -- its own box score,
-final stats -- is used as an input. Features (14):
+final stats -- is used as an input. Deployed features (10):
   - four factors (ORtg, eFG%, TOV%, ORB%) x home/away: rolling 7/30-day team average
     blended with the opponent's allowed average
-  - Injury Value / Injury Advanced x home/away: the team's rolling pre-game player value
-    (from player_game_stats) minus the value of the players on that game's inactive list
   - back-to-back x home/away
 
-Pass --no-injuries for the 10-feature version (works on a database with no
-player_game_stats table).
+Pass --with-injuries for the 14-feature research version, which adds point-in-time
+Injury Value / Injury Advanced (home/away) from player_game_stats. For logistic
+regression it was a tie with the 10-feature model (see results/SUMMARY.md and
+results/per_model_no_injuries.csv), and it needs per-player stats in the database.
 
 Two steps:
   1. Fit on every season before the last complete one, score on that season
@@ -31,7 +31,7 @@ import sys
 from pathlib import Path
 
 # Must be decided before model_comparison is imported (it picks the feature list at import).
-if '--no-injuries' in sys.argv:
+if '--with-injuries' not in sys.argv:
     os.environ['DROP_INJURIES'] = '1'
 
 from sklearn.ensemble import RandomForestClassifier
@@ -71,7 +71,7 @@ def main():
     parser.add_argument('--model', choices=['lr', 'rf'], default='lr')
     parser.add_argument('--out', type=Path, default=MODEL_PATH)
     parser.add_argument('--workers', type=int, default=4)
-    parser.add_argument('--no-injuries', action='store_true')
+    parser.add_argument('--with-injuries', action='store_true')
     args = parser.parse_args()
 
     cols = mc.FEATURE_COLUMNS
