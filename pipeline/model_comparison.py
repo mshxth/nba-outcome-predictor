@@ -103,6 +103,8 @@ if DROP_INJURIES:
     FEATURE_COLUMNS = [c for c in FEATURE_COLUMNS if 'Injury' not in c]
     FEATURES_CACHE = RESULTS_DIR / 'features_cache_no_injuries.pkl'
     PER_MODEL_CSV = RESULTS_DIR / 'per_model_no_injuries.csv'
+if os.environ.get('PER_MODEL_OUT'):  # write a per-model run somewhere else instead of overwriting results
+    PER_MODEL_CSV = Path(os.environ['PER_MODEL_OUT'])
 
 
 # ---------------------------------------------------------------- features
@@ -673,9 +675,9 @@ if __name__ == '__main__':
     df, drops = load_features(args.workers)
     if args.per_model:
         run_per_model(df, args.workers)
-        if DROP_INJURIES:
-            print(f'Ablation (no injury features): {FEATURE_COLUMNS}')
-            sys.exit(0)  # don't overwrite SUMMARY.md with the ablation
+        if DROP_INJURIES or os.environ.get('PER_MODEL_OUT'):
+            print(f'Features: {FEATURE_COLUMNS}')
+            sys.exit(0)  # don't overwrite SUMMARY.md with a one-off run
         summarize()
         sys.exit(0)
     drops.to_csv(DROPS_CSV, index=False)
